@@ -1,0 +1,9 @@
+whatsapp-service.exe
+storage/*
+.env
+
+#outros arquivos de teste
+comnds.js
+contact_response.json
+groups_response.json
+message_list_response.json

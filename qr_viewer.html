@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WhatsApp QR Code Viewer</title>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; }
+        #qrcode { margin: 30px auto; }
+        button { padding: 10px 20px; margin: 10px; }
+    </style>
+</head>
+<body>
+    <h1>WhatsApp QR Code Viewer</h1>
+    <div>
+        <label for="device_id">ID do Dispositivo:</label>
+        <input type="number" id="device_id" value="1" min="1">
+        <button onclick="getQRCode()">Obter QR Code</button>
+    </div>
+    <div id="qrcode"></div>
+    <div id="status"></div>
+
+    <script>
+        async function getQRCode() {
+            const deviceId = document.getElementById('device_id').value;
+            const statusDiv = document.getElementById('status');
+            statusDiv.innerHTML = "Obtendo QR code...";
+            
+            try {
+                const response = await fetch(`http://localhost:8080/api/devices/${deviceId}/qrcode`);
+                const data = await response.json();
+                
+                if (data.error) {
+                    statusDiv.innerHTML = `Erro: ${data.error}`;
+                    return;
+                }
+                
+                if (data.qr_code) {
+                    displayQRCode(data.qr_code);
+                    statusDiv.innerHTML = "QR Code gerado! Escaneie com o WhatsApp no seu celular.";
+                    
+                    // Verificar status a cada 3 segundos
+                    const checkInterval = setInterval(async () => {
+                        const statusResponse = await fetch(`http://localhost:8080/api/devices/${deviceId}/status`);
+                        const statusData = await statusResponse.json();
+                        
+                        if (statusData.connected) {
+                            statusDiv.innerHTML = "Conectado com sucesso!";
+                            clearInterval(checkInterval);
+                        }
+                    }, 3000);
+                } else {
+                    statusDiv.innerHTML = "Não foi possível obter o QR code.";
+                }
+            } catch (error) {
+                statusDiv.innerHTML = `Erro na requisição: ${error.message}`;
+            }
+        }
+        
+        function displayQRCode(qrData) {
+            const qrDiv = document.getElementById('qrcode');
+            qrDiv.innerHTML = '';
+            
+            const typeNumber = 0;
+            const errorCorrectionLevel = 'L';
+            const qr = qrcode(typeNumber, errorCorrectionLevel);
+            qr.addData(qrData);
+            qr.make();
+            
+            qrDiv.innerHTML = qr.createImgTag(5);
+        }
+    </script>
+</body>
+</html>
