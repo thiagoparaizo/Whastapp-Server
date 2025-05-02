@@ -4,19 +4,23 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
+
+	"whatsapp-service/internal/client"
 )
 
 // DB é uma instância de conexão com o banco de dados
 type DB struct {
 	*sqlx.DB
+	AssistantClient *client.AssistantClient // Cliente para o Assistant API
 }
 
 // New cria uma nova conexão com o banco de dados
-func New(connectionString string) (*DB, error) {
+func New(connectionString string, assistantAPIURL string) (*DB, error) {
 	db, err := sqlx.Connect("postgres", connectionString)
 	if err != nil {
 		return nil, fmt.Errorf("falha ao conectar ao banco de dados: %w", err)
@@ -31,7 +35,13 @@ func New(connectionString string) (*DB, error) {
 		return nil, err
 	}
 
-	return &DB{DB: db}, nil
+	// Criar cliente para o Assistant API
+	assistantClient := client.NewAssistantClient(assistantAPIURL)
+
+	return &DB{
+		DB:              db,
+		AssistantClient: assistantClient,
+	}, nil
 }
 
 // createTables cria as tabelas necessárias, se elas não existirem
@@ -68,6 +78,16 @@ func (db *DB) GetDevicesByTenantID(tenantID int64) ([]WhatsAppDevice, error) {
 	return devices, nil
 }
 
+func (db *DB) ValidateTenant(tenantID int64) (bool, error) {
+	response, err := db.AssistantClient.ValidateTenant(int(tenantID))
+	if err != nil {
+		// Falha ao contactar o Assistant API, considerar o tenant inválido
+		return false, fmt.Errorf("falha ao validar tenant: %w", err)
+	}
+
+	return response.Exists && response.IsActive, nil
+}
+
 // GetDeviceByJID busca um dispositivo pelo JID
 func (db *DB) GetDeviceByJID(jid string) (*WhatsAppDevice, error) {
 	var device WhatsAppDevice
@@ -83,6 +103,16 @@ func (db *DB) GetDeviceByJID(jid string) (*WhatsAppDevice, error) {
 
 // CreateDevice cria um novo dispositivo
 func (db *DB) CreateDevice(device *WhatsAppDevice) error {
+	// Validar o tenant antes de criar o dispositivo
+	isValid, err := db.ValidateTenant(device.TenantID)
+	if err != nil {
+		return fmt.Errorf("erro ao validar tenant: %w", err)
+	}
+
+	if !isValid {
+		return fmt.Errorf("tenant inválido ou inativo")
+	}
+
 	query := `
 		INSERT INTO whatsapp_devices (
 			tenant_id, name, description, phone_number, status
@@ -191,7 +221,7 @@ func (db *DB) SaveMessage(message *WhatsAppMessage) error {
         RETURNING id
     `
 
-	return db.QueryRow(
+	err := db.QueryRow(
 		query,
 		message.DeviceID,
 		message.JID,
@@ -204,6 +234,50 @@ func (db *DB) SaveMessage(message *WhatsAppMessage) error {
 		message.MediaType,
 		message.Timestamp,
 	).Scan(&message.ID)
+
+	// Após salvar a mensagem, notificar o Assistant API sobre o evento
+	// Este passo é assíncrono e não afeta o retorno da função
+	go db.notifyAssistantAboutMessage(message)
+
+	return err
+}
+
+// notifyAssistantAboutMessage envia informações de mensagem para o Assistant API
+func (db *DB) notifyAssistantAboutMessage(message *WhatsAppMessage) {
+	// Obter informações do dispositivo para resgatar o tenant_id
+	device, err := db.GetDeviceByID(message.DeviceID)
+	if err != nil || device == nil {
+		// Se não conseguir obter o dispositivo, não podemos notificar
+		return
+	}
+
+	// Criar evento para enviar ao Assistant
+	event := map[string]interface{}{
+		"device_id":  message.DeviceID,
+		"tenant_id":  device.TenantID,
+		"event_type": "*events.Message",
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"event": map[string]interface{}{
+			"Info": map[string]interface{}{
+				"Chat":     message.JID,
+				"Sender":   message.Sender,
+				"IsFromMe": message.IsFromMe,
+				"IsGroup":  message.IsGroup,
+			},
+			"Message": map[string]interface{}{
+				"Conversation": message.Content,
+				"MediaURL":     message.MediaURL,
+				"MediaType":    message.MediaType,
+			},
+		},
+	}
+
+	// Enviar para o Assistant API
+	err = db.AssistantClient.SendWebhookEvent(event)
+	if err != nil {
+		// Log do erro, mas não afeta o fluxo principal
+		fmt.Printf("Erro ao notificar Assistant sobre mensagem: %v\n", err)
+	}
 }
 
 // GetMessages obtém mensagens com base nos filtros
@@ -320,4 +394,384 @@ func (db *DB) GetTrackedEntity(deviceID int64, jid string) (*TrackedEntity, erro
 	}
 
 	return &entity, nil
+}
+
+// GetAllTenants retorna todos os tenants do sistema
+func (db *DB) GetAllTenants() ([]map[string]interface{}, error) {
+	tenants, err := db.AssistantClient.ListActiveTenants()
+	if err != nil {
+		return nil, fmt.Errorf("falha ao listar tenants: %w", err)
+	}
+
+	// Converter para formato compatível com o código existente
+	result := make([]map[string]interface{}, len(tenants))
+	for i, tenant := range tenants {
+		result[i] = map[string]interface{}{
+			"ID":          tenant.ID,
+			"name":        tenant.Name,
+			"description": tenant.Description,
+		}
+	}
+
+	return result, nil
+}
+
+// SaveWebhookConfig salva uma configuração de webhook
+func (db *DB) SaveWebhookConfig(config *WebhookConfig) error {
+	query := `
+        INSERT INTO webhook_configs (
+            tenant_id, url, secret, events, device_ids, enabled, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        ) RETURNING id, created_at, updated_at
+    `
+
+	// Converter slices para arrays de SQL
+	events := pq.Array(config.Events)
+	deviceIDs := pq.Array(config.DeviceIDs)
+
+	err := db.QueryRow(
+		query,
+		config.TenantID,
+		config.URL,
+		config.Secret,
+		events,
+		deviceIDs,
+		config.Enabled,
+	).Scan(&config.ID, &config.CreatedAt, &config.UpdatedAt)
+
+	return err
+}
+
+// UpdateWebhookConfig atualiza uma configuração de webhook existente
+func (db *DB) UpdateWebhookConfig(config *WebhookConfig) error {
+	query := `
+        UPDATE webhook_configs SET
+            url = $1,
+            secret = $2,
+            events = $3,
+            device_ids = $4,
+            enabled = $5,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $6
+    `
+
+	// Converter slices para arrays de SQL
+	events := pq.Array(config.Events)
+	deviceIDs := pq.Array(config.DeviceIDs)
+
+	_, err := db.Exec(
+		query,
+		config.URL,
+		config.Secret,
+		events,
+		deviceIDs,
+		config.Enabled,
+		config.ID,
+	)
+
+	return err
+}
+
+// GetWebhookConfigsByTenant busca configurações de webhook por tenant
+func (db *DB) GetWebhookConfigsByTenant(tenantID int64) ([]WebhookConfig, error) {
+	var configs []WebhookConfig
+
+	query := `
+        SELECT 
+            id, tenant_id, url, secret, events, device_ids, enabled, created_at, updated_at
+        FROM 
+            webhook_configs
+        WHERE 
+            tenant_id = $1
+    `
+
+	rows, err := db.Query(query, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var config WebhookConfig
+		var events, deviceIDs pq.StringArray
+
+		err := rows.Scan(
+			&config.ID,
+			&config.TenantID,
+			&config.URL,
+			&config.Secret,
+			&events,
+			&deviceIDs,
+			&config.Enabled,
+			&config.CreatedAt,
+			&config.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// Converter arrays de SQL para slices
+		config.Events = []string(events)
+
+		// Converter string IDs para int64
+		config.DeviceIDs = make([]int64, len(deviceIDs))
+		for i, id := range deviceIDs {
+			idInt, err := strconv.ParseInt(id, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			config.DeviceIDs[i] = idInt
+		}
+
+		configs = append(configs, config)
+	}
+
+	return configs, nil
+}
+
+// GetWebhookConfigByID busca uma configuração de webhook por ID
+func (db *DB) GetWebhookConfigByID(id int64) (*WebhookConfig, error) {
+	var config WebhookConfig
+	var events, deviceIDs pq.StringArray
+
+	query := `
+        SELECT 
+            id, tenant_id, url, secret, events, device_ids, enabled, created_at, updated_at
+        FROM 
+            webhook_configs
+        WHERE 
+            id = $1
+    `
+
+	err := db.QueryRow(query, id).Scan(
+		&config.ID,
+		&config.TenantID,
+		&config.URL,
+		&config.Secret,
+		&events,
+		&deviceIDs,
+		&config.Enabled,
+		&config.CreatedAt,
+		&config.UpdatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	// Converter arrays de SQL para slices
+	config.Events = []string(events)
+
+	// Converter string IDs para int64
+	config.DeviceIDs = make([]int64, len(deviceIDs))
+	for i, id := range deviceIDs {
+		idInt, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		config.DeviceIDs[i] = idInt
+	}
+
+	return &config, nil
+}
+
+// DeleteWebhookConfig exclui uma configuração de webhook
+func (db *DB) DeleteWebhookConfig(id int64) error {
+	_, err := db.Exec("DELETE FROM webhook_configs WHERE id = $1", id)
+	return err
+}
+
+// LogWebhookDelivery registra uma tentativa de entrega de webhook
+func (db *DB) LogWebhookDelivery(delivery *WebhookDelivery) error {
+	query := `
+        INSERT INTO webhook_deliveries (
+            webhook_id, event_type, payload, response_code, response_body, 
+            error_message, attempt_count, status, next_retry_at,
+            created_at, last_updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        ) RETURNING id, created_at, last_updated_at
+    `
+
+	err := db.QueryRow(
+		query,
+		delivery.WebhookID,
+		delivery.EventType,
+		delivery.Payload,
+		delivery.ResponseCode,
+		delivery.ResponseBody,
+		delivery.ErrorMessage,
+		delivery.AttemptCount,
+		delivery.Status,
+		delivery.NextRetryAt,
+	).Scan(&delivery.ID, &delivery.CreatedAt, &delivery.LastUpdatedAt)
+
+	return err
+}
+
+// GetPendingWebhookDeliveries busca entregas de webhook pendentes ou com falha para retentar
+func (db *DB) GetPendingWebhookDeliveries() ([]WebhookDelivery, error) {
+	var deliveries []WebhookDelivery
+
+	query := `
+        SELECT 
+            id, webhook_id, event_type, payload, response_code, response_body,
+            error_message, attempt_count, status, next_retry_at, created_at, last_updated_at
+        FROM 
+            webhook_deliveries
+        WHERE 
+            (status = 'pending' OR status = 'retrying')
+            AND (next_retry_at IS NULL OR next_retry_at <= CURRENT_TIMESTAMP)
+        ORDER BY
+            created_at ASC
+        LIMIT 100
+    `
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var delivery WebhookDelivery
+		err := rows.Scan(
+			&delivery.ID,
+			&delivery.WebhookID,
+			&delivery.EventType,
+			&delivery.Payload,
+			&delivery.ResponseCode,
+			&delivery.ResponseBody,
+			&delivery.ErrorMessage,
+			&delivery.AttemptCount,
+			&delivery.Status,
+			&delivery.NextRetryAt,
+			&delivery.CreatedAt,
+			&delivery.LastUpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		deliveries = append(deliveries, delivery)
+	}
+
+	return deliveries, nil
+}
+
+// UpdateWebhookDeliveryStatus atualiza o status de uma entrega de webhook
+func (db *DB) UpdateWebhookDeliveryStatus(id int64, status string, responseCode int, responseBody string, errorMessage string, attemptCount int, nextRetry *time.Time) error {
+	query := `
+        UPDATE webhook_deliveries SET
+            status = $1,
+            response_code = $2,
+            response_body = $3,
+            error_message = $4,
+            attempt_count = $5,
+            next_retry_at = $6,
+            last_updated_at = CURRENT_TIMESTAMP
+        WHERE id = $7
+    `
+
+	_, err := db.Exec(
+		query,
+		status,
+		responseCode,
+		responseBody,
+		errorMessage,
+		attemptCount,
+		nextRetry,
+		id,
+	)
+
+	return err
+}
+
+// TODO
+// Definição simplificada de Tenant para este contexto
+type Tenant struct {
+	ID   int64
+	Name string
+}
+
+// WebhookLog representa um log de entrega de webhook para a API
+type WebhookLog struct {
+	ID           int64     `json:"id"`
+	WebhookID    int64     `json:"webhook_id"`
+	EventType    string    `json:"event_type"`
+	Status       string    `json:"status"`
+	AttemptCount int       `json:"attempt_count"`
+	ResponseCode int       `json:"response_code"`
+	ResponseBody string    `json:"response_body"`
+	ErrorMessage string    `json:"error_message"`
+	Payload      string    `json:"payload"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"last_updated_at"`
+}
+
+// GetWebhookLogs busca logs de entrega de um webhook específico
+func (db *DB) GetWebhookLogs(webhookID int64, status string, limit int) ([]WebhookLog, error) {
+	var logs []WebhookLog
+
+	// Construir query com filtros opcionais
+	query := `
+        SELECT 
+            id, webhook_id, event_type, status, attempt_count, 
+            response_code, response_body, error_message, payload,
+            created_at, last_updated_at
+        FROM 
+            webhook_deliveries
+        WHERE 
+            webhook_id = $1
+    `
+
+	args := []interface{}{webhookID}
+
+	// Adicionar filtro por status se fornecido
+	if status != "" && status != "all" {
+		query += " AND status = $2"
+		args = append(args, status)
+	}
+
+	// Ordenar por data de criação (mais recente primeiro)
+	query += " ORDER BY created_at DESC LIMIT $" + strconv.Itoa(len(args)+1)
+	args = append(args, limit)
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var log WebhookLog
+		err := rows.Scan(
+			&log.ID,
+			&log.WebhookID,
+			&log.EventType,
+			&log.Status,
+			&log.AttemptCount,
+			&log.ResponseCode,
+			&log.ResponseBody,
+			&log.ErrorMessage,
+			&log.Payload,
+			&log.CreatedAt,
+			&log.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		logs = append(logs, log)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return logs, nil
 }

@@ -4,9 +4,13 @@ package whatsapp
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,9 +23,12 @@ import (
 
 // WebhookConfig contém a configuração para enviar eventos para um webhook
 type WebhookConfig struct {
-	URL    string   `json:"url"`
-	Secret string   `json:"secret,omitempty"`
-	Events []string `json:"events,omitempty"` // Tipos de eventos a enviar, vazio = todos
+	URL       string   `json:"url"`
+	Secret    string   `json:"secret,omitempty"`
+	Events    []string `json:"events,omitempty"` // Tipos de eventos a enviar, vazio = todos
+	TenantID  int64    `json:"tenant_id"`
+	DeviceIDs []int64  `json:"device_ids,omitempty"` // IDs de dispositivos específicos, vazio = todos
+	Enabled   bool     `json:"enabled"`              // Tipos de eventos a enviar, vazio = todos
 }
 
 // EventHandler gerencia o processamento de eventos do WhatsApp
@@ -414,8 +421,23 @@ func getExtensionFromMime(mimeType string) string {
 
 // sendToWebhook envia um evento para o webhook configurado
 func (h *EventHandler) sendToWebhook(deviceID int64, evt interface{}) {
-	if h.WebhookConfig == nil || h.WebhookConfig.URL == "" {
-		return // Sem webhook configurado
+	// Verificar se webhook está configurado e habilitado
+	if h.WebhookConfig == nil || h.WebhookConfig.URL == "" || !h.WebhookConfig.Enabled {
+		return // Sem webhook configurado ou desabilitado
+	}
+
+	// Verificar se o dispositivo está na lista de dispositivos ou se está vazia (todos)
+	if len(h.WebhookConfig.DeviceIDs) > 0 {
+		deviceFound := false
+		for _, id := range h.WebhookConfig.DeviceIDs {
+			if id == deviceID {
+				deviceFound = true
+				break
+			}
+		}
+		if !deviceFound {
+			return // Este dispositivo não está configurado para este webhook
+		}
 	}
 
 	// Verificar se este tipo de evento deve ser enviado
@@ -442,6 +464,11 @@ func (h *EventHandler) sendToWebhook(deviceID int64, evt interface{}) {
 		tenantID = device.TenantID
 	}
 
+	// Verificar se o tenant corresponde ao configurado
+	if h.WebhookConfig.TenantID != 0 && tenantID != h.WebhookConfig.TenantID {
+		return // Este evento não é para o tenant configurado
+	}
+
 	webhookData := map[string]interface{}{
 		"device_id":  deviceID,
 		"tenant_id":  tenantID,
@@ -454,22 +481,102 @@ func (h *EventHandler) sendToWebhook(deviceID int64, evt interface{}) {
 	jsonData, err := json.Marshal(webhookData)
 	if err != nil {
 		fmt.Printf("Erro ao serializar evento para webhook: %v\n", err)
+		// Registrar falha no banco de dados
+		h.logWebhookDeliveryFailure(deviceID, fmt.Sprintf("%T", evt), jsonData, 0, "", fmt.Sprintf("Erro ao serializar: %v", err))
 		return
+	}
+
+	// Criar assinatura se um segredo for fornecido
+	var signature string
+	if h.WebhookConfig.Secret != "" {
+		signature = generateSignature(jsonData, h.WebhookConfig.Secret)
 	}
 
 	// Enviar para o webhook
 	req, err := http.NewRequest("POST", h.WebhookConfig.URL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		fmt.Printf("Erro ao criar requisição para webhook: %v\n", err)
+		h.logWebhookDeliveryFailure(deviceID, fmt.Sprintf("%T", evt), jsonData, 0, "", fmt.Sprintf("Erro ao criar requisição: %v", err))
 		return
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "WhatsApp-Service-Webhook/1.0")
+
+	if signature != "" {
+		req.Header.Set("X-Webhook-Signature", signature)
+	}
+
 	if h.WebhookConfig.Secret != "" {
 		req.Header.Set("X-Webhook-Secret", h.WebhookConfig.Secret)
 	}
 
-	// Enviar a requisição
+	// Enviar a requisição com timeout
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	req = req.WithContext(ctx)
+
+	resp, err := h.httpClient.Do(req)
+
+	// Processar resposta ou erro
+	if err != nil {
+		fmt.Printf("Erro ao enviar evento para webhook: %v\n", err)
+		h.logWebhookDeliveryFailure(deviceID, fmt.Sprintf("%T", evt), jsonData, 0, "", fmt.Sprintf("Erro ao enviar: %v", err))
+		// Agendar reenvio em background
+		go h.scheduleWebhookRetry(deviceID, fmt.Sprintf("%T", evt), jsonData)
+		return
+	}
+
+	defer resp.Body.Close()
+
+	// Ler corpo da resposta para logging
+	responseBody, _ := ioutil.ReadAll(resp.Body)
+	responseStr := string(responseBody)
+
+	if resp.StatusCode >= 400 {
+		fmt.Printf("Webhook retornou status de erro: %d\n", resp.StatusCode)
+		h.logWebhookDeliveryFailure(deviceID, fmt.Sprintf("%T", evt), jsonData, resp.StatusCode, responseStr, fmt.Sprintf("Status de erro: %d", resp.StatusCode))
+		// Agendar reenvio se for um erro temporário (5xx)
+		if resp.StatusCode >= 500 {
+			go h.scheduleWebhookRetry(deviceID, fmt.Sprintf("%T", evt), jsonData)
+		}
+	} else {
+		// Registrar sucesso
+		h.logWebhookDeliverySuccess(deviceID, fmt.Sprintf("%T", evt), jsonData, resp.StatusCode, responseStr)
+	}
+}
+
+func (h *EventHandler) SendTestWebhook(url string, secret string, payload interface{}) (bool, error) {
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return false, fmt.Errorf("erro ao serializar payload: %v", err)
+	}
+
+	// Criar assinatura se um segredo for fornecido
+	var signature string
+	if secret != "" {
+		signature = generateSignature(jsonData, secret)
+	}
+
+	// Enviar para o webhook
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return false, fmt.Errorf("erro ao criar requisição: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "WhatsApp-Service-Webhook-Test/1.0")
+
+	if signature != "" {
+		req.Header.Set("X-Webhook-Signature", signature)
+	}
+
+	if secret != "" {
+		req.Header.Set("X-Webhook-Secret", secret)
+	}
+
+	// Enviar a requisição com timeout
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
@@ -477,12 +584,290 @@ func (h *EventHandler) sendToWebhook(deviceID int64, evt interface{}) {
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		fmt.Printf("Erro ao enviar evento para webhook: %v\n", err)
-		return
+		return false, fmt.Errorf("erro ao enviar requisição: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		fmt.Printf("Webhook retornou status de erro: %d\n", resp.StatusCode)
+	// Verificar se o status code é de sucesso
+	return resp.StatusCode >= 200 && resp.StatusCode < 300, nil
+}
+
+// Método para gerar assinatura para autenticação de webhook
+func generateSignature(payload []byte, secret string) string {
+	// Criar HMAC SHA256
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write(payload)
+
+	// Retornar assinatura em formato hexadecimal
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Método para registrar falha de entrega de webhook no banco de dados
+func (h *EventHandler) logWebhookDeliveryFailure(deviceID int64, eventType string, payload []byte, statusCode int, responseBody string, errorMessage string) {
+	// Identificar o webhook configurado (assumindo um único webhook global por enquanto)
+	var webhookID int64 = 0
+
+	// Idealmente, você buscaria o ID do webhook no banco com base no URL configurado
+	// Para simplificar, vamos assumir que temos apenas um webhook configurado
+
+	// Criar registro de entrega
+	delivery := &database.WebhookDelivery{
+		WebhookID:    webhookID,
+		EventType:    eventType,
+		Payload:      string(payload),
+		ResponseCode: statusCode,
+		ResponseBody: responseBody,
+		ErrorMessage: errorMessage,
+		AttemptCount: 1,
+		Status:       "failed",
+		NextRetryAt:  time.Time{}, // Sem próxima tentativa
+	}
+
+	// Salvar no banco de dados
+	err := h.DB.LogWebhookDelivery(delivery)
+	if err != nil {
+		fmt.Printf("Erro ao registrar falha de entrega de webhook: %v\n", err)
+	}
+}
+
+// Método para registrar sucesso de entrega de webhook
+func (h *EventHandler) logWebhookDeliverySuccess(deviceID int64, eventType string, payload []byte, statusCode int, responseBody string) {
+	// Identificar o webhook configurado (assumindo um único webhook global por enquanto)
+	var webhookID int64 = 0
+
+	// Criar registro de entrega
+	delivery := &database.WebhookDelivery{
+		WebhookID:    webhookID,
+		EventType:    eventType,
+		Payload:      string(payload),
+		ResponseCode: statusCode,
+		ResponseBody: responseBody,
+		ErrorMessage: "",
+		AttemptCount: 1,
+		Status:       "success",
+		NextRetryAt:  time.Time{}, // Sem próxima tentativa
+	}
+
+	// Salvar no banco de dados
+	err := h.DB.LogWebhookDelivery(delivery)
+	if err != nil {
+		fmt.Printf("Erro ao registrar sucesso de entrega de webhook: %v\n", err)
+	}
+}
+
+// Método para agendar reenvio de webhook em caso de falha
+func (h *EventHandler) scheduleWebhookRetry(deviceID int64, eventType string, payload []byte) {
+	// Identificar o webhook configurado
+	var webhookID int64 = 0
+
+	// Idealmente, buscar a entrega anterior para incrementar attempt_count
+	// Para simplificar, vamos criar uma nova entrada
+
+	// Calcular próxima tentativa com backoff exponencial
+	attemptCount := 1
+	// Backoff exponencial: 5s, 25s, 125s, etc. (5 * 5^n segundos)
+	nextRetryDelay := time.Duration(5*math.Pow(5, float64(attemptCount-1))) * time.Second
+	nextRetryTime := time.Now().Add(nextRetryDelay)
+
+	// Limitar número máximo de tentativas (exemplo: 5)
+	maxAttempts := 5
+	if attemptCount > maxAttempts {
+		fmt.Printf("Número máximo de tentativas alcançado para webhook. Desistindo.\n")
+		return
+	}
+
+	// Criar registro de entrega para reenvio
+	delivery := &database.WebhookDelivery{
+		WebhookID:    webhookID,
+		EventType:    eventType,
+		Payload:      string(payload),
+		ResponseCode: 0,
+		ResponseBody: "",
+		ErrorMessage: "Agendado para reenvio",
+		AttemptCount: attemptCount,
+		Status:       "pending",
+		NextRetryAt:  nextRetryTime,
+	}
+
+	// Salvar no banco de dados
+	err := h.DB.LogWebhookDelivery(delivery)
+	if err != nil {
+		fmt.Printf("Erro ao agendar reenvio de webhook: %v\n", err)
+	}
+}
+
+// Método para processar reenvios pendentes
+// Este método seria chamado periodicamente por uma goroutine separada
+func (h *EventHandler) ProcessPendingWebhooks() {
+	// Buscar webhooks pendentes
+	pendingDeliveries, err := h.DB.GetPendingWebhookDeliveries()
+	if err != nil {
+		fmt.Printf("Erro ao buscar webhooks pendentes: %v\n", err)
+		return
+	}
+
+	for _, delivery := range pendingDeliveries {
+		// Obter configuração do webhook
+		webhookConfig, err := h.DB.GetWebhookConfigByID(delivery.WebhookID)
+		if err != nil || webhookConfig == nil {
+			fmt.Printf("Configuração de webhook não encontrada para ID %d: %v\n", delivery.WebhookID, err)
+			continue
+		}
+
+		// Verificar se webhook ainda está habilitado
+		if !webhookConfig.Enabled {
+			// Marcar como falha permanente
+			h.DB.UpdateWebhookDeliveryStatus(
+				delivery.ID,
+				"cancelled",
+				0,
+				"",
+				"Webhook desabilitado",
+				delivery.AttemptCount,
+				nil,
+			)
+			continue
+		}
+
+		// Tentar reenviar
+		payloadBytes := []byte(delivery.Payload)
+
+		// Criar assinatura se necessário
+		var signature string
+		if webhookConfig.Secret != "" {
+			signature = generateSignature(payloadBytes, webhookConfig.Secret)
+		}
+
+		// Criar e enviar requisição
+		req, err := http.NewRequest("POST", webhookConfig.URL, bytes.NewBuffer(payloadBytes))
+		if err != nil {
+			fmt.Printf("Erro ao criar requisição para reenvio: %v\n", err)
+
+			// Atualizar status
+			h.DB.UpdateWebhookDeliveryStatus(
+				delivery.ID,
+				"failed",
+				0,
+				"",
+				fmt.Sprintf("Erro ao criar requisição: %v", err),
+				delivery.AttemptCount+1,
+				nil,
+			)
+			continue
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		if signature != "" {
+			req.Header.Set("X-Webhook-Signature", signature)
+		}
+
+		// Timeout para reenvio
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		req = req.WithContext(ctx)
+
+		// Enviar requisição
+		resp, err := h.httpClient.Do(req)
+		cancel() // Cancelar o contexto independente do resultado
+
+		if err != nil {
+			fmt.Printf("Erro ao reenviar webhook: %v\n", err)
+
+			// Calcular próxima tentativa com backoff exponencial
+			nextAttemptCount := delivery.AttemptCount + 1
+			maxAttempts := 5
+
+			if nextAttemptCount > maxAttempts {
+				// Desistir após número máximo de tentativas
+				h.DB.UpdateWebhookDeliveryStatus(
+					delivery.ID,
+					"failed",
+					0,
+					"",
+					fmt.Sprintf("Número máximo de tentativas alcançado: %v", err),
+					nextAttemptCount,
+					nil,
+				)
+			} else {
+				// Agendar próxima tentativa
+				nextRetryDelay := time.Duration(5*math.Pow(5, float64(nextAttemptCount-1))) * time.Second
+				nextRetryTime := time.Now().Add(nextRetryDelay)
+
+				h.DB.UpdateWebhookDeliveryStatus(
+					delivery.ID,
+					"retrying",
+					0,
+					"",
+					fmt.Sprintf("Erro ao enviar: %v", err),
+					nextAttemptCount,
+					&nextRetryTime,
+				)
+			}
+
+			continue
+		}
+
+		// Processar resposta
+		defer resp.Body.Close()
+		responseBody, _ := ioutil.ReadAll(resp.Body)
+		responseStr := string(responseBody)
+
+		if resp.StatusCode >= 400 {
+			fmt.Printf("Reenvio de webhook retornou status de erro: %d\n", resp.StatusCode)
+
+			// Para erros 5xx, tentar novamente se não excedeu o limite
+			if resp.StatusCode >= 500 {
+				nextAttemptCount := delivery.AttemptCount + 1
+				maxAttempts := 5
+
+				if nextAttemptCount > maxAttempts {
+					// Desistir após número máximo de tentativas
+					h.DB.UpdateWebhookDeliveryStatus(
+						delivery.ID,
+						"failed",
+						resp.StatusCode,
+						responseStr,
+						fmt.Sprintf("Número máximo de tentativas alcançado. Último status: %d", resp.StatusCode),
+						nextAttemptCount,
+						nil,
+					)
+				} else {
+					// Agendar próxima tentativa
+					nextRetryDelay := time.Duration(5*math.Pow(5, float64(nextAttemptCount-1))) * time.Second
+					nextRetryTime := time.Now().Add(nextRetryDelay)
+
+					h.DB.UpdateWebhookDeliveryStatus(
+						delivery.ID,
+						"retrying",
+						resp.StatusCode,
+						responseStr,
+						fmt.Sprintf("Erro de servidor: %d", resp.StatusCode),
+						nextAttemptCount,
+						&nextRetryTime,
+					)
+				}
+			} else {
+				// Para erros 4xx, não tentar novamente (problema no cliente)
+				h.DB.UpdateWebhookDeliveryStatus(
+					delivery.ID,
+					"failed",
+					resp.StatusCode,
+					responseStr,
+					fmt.Sprintf("Erro no cliente: %d", resp.StatusCode),
+					delivery.AttemptCount+1,
+					nil,
+				)
+			}
+		} else {
+			// Sucesso!
+			h.DB.UpdateWebhookDeliveryStatus(
+				delivery.ID,
+				"success",
+				resp.StatusCode,
+				responseStr,
+				"",
+				delivery.AttemptCount+1,
+				nil,
+			)
+		}
 	}
 }

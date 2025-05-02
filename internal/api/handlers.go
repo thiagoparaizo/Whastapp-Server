@@ -3,8 +3,10 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -324,9 +326,12 @@ func (h *Handler) GetWhatsAppHealth(c *gin.Context) {
 // WebhookConfig configura um webhook para envio de eventos
 func (h *Handler) WebhookConfig(c *gin.Context) {
 	var request struct {
-		URL    string   `json:"url" binding:"required"`
-		Events []string `json:"events"`
-		Secret string   `json:"secret"`
+		URL       string   `json:"url" binding:"required"`
+		Secret    string   `json:"secret"`
+		Events    []string `json:"events"`
+		TenantID  int64    `json:"tenant_id" binding:"required"`
+		DeviceIDs []int64  `json:"device_ids"`
+		Enabled   bool     `json:"enabled" default:"true"`
 	}
 
 	if err := c.ShouldBindJSON(&request); err != nil {
@@ -334,11 +339,163 @@ func (h *Handler) WebhookConfig(c *gin.Context) {
 		return
 	}
 
-	// Aqui você implementaria a lógica para configurar um webhook
-	// para o serviço principal, que seria salvo no banco de dados
-	// e usado para enviar eventos do WhatsApp
+	// Validar URL
+	_, err := url.Parse(request.URL)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "URL inválida"})
+		return
+	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "webhook configurado"})
+	// Configurar webhook no EventHandler global
+	h.WhatsAppMgr.ConfigureWebhook(&whatsapp.WebhookConfig{
+		URL:       request.URL,
+		Secret:    request.Secret,
+		Events:    request.Events,
+		TenantID:  request.TenantID,
+		DeviceIDs: request.DeviceIDs,
+		Enabled:   request.Enabled,
+	})
+
+	// Salvar configuração no banco de dados para persistência
+	webhookConfig := &database.WebhookConfig{
+		TenantID:  request.TenantID,
+		URL:       request.URL,
+		Secret:    request.Secret,
+		Events:    request.Events,
+		DeviceIDs: request.DeviceIDs,
+		Enabled:   request.Enabled,
+	}
+
+	err = h.DB.SaveWebhookConfig(webhookConfig)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Erro ao salvar configuração: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "success",
+		"message":   "Webhook configurado com sucesso",
+		"config_id": webhookConfig.ID,
+	})
+}
+
+func (h *Handler) GetWebhookConfigs(c *gin.Context) {
+	tenantIDStr := c.Query("tenant_id")
+
+	if tenantIDStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id é obrigatório"})
+		return
+	}
+
+	tenantID, err := strconv.ParseInt(tenantIDStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id inválido"})
+		return
+	}
+
+	configs, err := h.DB.GetWebhookConfigsByTenant(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, configs)
+}
+
+// Adicionar método para excluir webhook
+func (h *Handler) DeleteWebhookConfig(c *gin.Context) {
+	configIDStr := c.Param("id")
+
+	configID, err := strconv.ParseInt(configIDStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID inválido"})
+		return
+	}
+
+	// Obter configuração atual
+	config, err := h.DB.GetWebhookConfigByID(configID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if config == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Configuração não encontrada"})
+		return
+	}
+
+	// Desabilitar webhook no manager (mantendo a mesma URL mas desabilitado)
+	h.WhatsAppMgr.ConfigureWebhook(&whatsapp.WebhookConfig{
+		URL:       config.URL,
+		TenantID:  config.TenantID,
+		Events:    config.Events,
+		DeviceIDs: config.DeviceIDs,
+		Enabled:   false, // Marcar como desabilitado
+	})
+
+	// Excluir do banco de dados
+	err = h.DB.DeleteWebhookConfig(configID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "webhook removido com sucesso"})
+}
+
+// Testar webhook
+func (h *Handler) TestWebhook(c *gin.Context) {
+	configIDStr := c.Param("id")
+
+	configID, err := strconv.ParseInt(configIDStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID inválido"})
+		return
+	}
+
+	// Obter configuração
+	config, err := h.DB.GetWebhookConfigByID(configID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if config == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Configuração não encontrada"})
+		return
+	}
+
+	// Criar evento de teste
+	testEvent := map[string]interface{}{
+		"event_type": "test_event",
+		"tenant_id":  config.TenantID,
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"message":    "Este é um evento de teste para verificar a configuração do webhook",
+	}
+
+	// Tentar enviar
+	success, err := h.WhatsAppMgr.SendTestWebhook(config.URL, config.Secret, testEvent)
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status":  "error",
+			"message": fmt.Sprintf("Falha ao testar webhook: %v", err),
+		})
+		return
+	}
+
+	if !success {
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "error",
+			"message": "O servidor de webhook retornou um erro",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": "Teste de webhook enviado com sucesso",
+	})
 }
 
 // GetPendingDevices retorna dispositivos pendentes de aprovação
@@ -719,4 +876,46 @@ func (h *Handler) DeleteTrackedEntity(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
+}
+
+// GetWebhookLogs retorna os logs de entrega de um webhook específico
+func (h *Handler) GetWebhookLogs(c *gin.Context) {
+	webhookIDStr := c.Param("id")
+
+	webhookID, err := strconv.ParseInt(webhookIDStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID inválido"})
+		return
+	}
+
+	// Obter configuração do webhook para verificar permissão
+	config, err := h.DB.GetWebhookConfigByID(webhookID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if config == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Webhook não encontrado"})
+		return
+	}
+
+	// Obter query params para paginação e filtros
+	limit := 50
+	if limitStr := c.Query("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 100 {
+			limit = l
+		}
+	}
+
+	status := c.Query("status") // filtro por status
+
+	// Buscar logs
+	logs, err := h.DB.GetWebhookLogs(webhookID, status, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, logs)
 }

@@ -43,6 +43,13 @@ func SetupRoutes(router *gin.Engine, handler *Handler) {
 		}
 
 		// Webhook
-		api.POST("/webhook", handler.WebhookConfig)
+		webhook := api.Group("/webhook")
+		{
+			webhook.POST("", handler.WebhookConfig)
+			webhook.GET("", handler.GetWebhookConfigs)
+			webhook.DELETE("/:id", handler.DeleteWebhookConfig)
+			webhook.POST("/:id/test", handler.TestWebhook)
+			webhook.GET("/:id/logs", handler.GetWebhookLogs)
+		}
 	}
 }

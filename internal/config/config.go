@@ -18,6 +18,7 @@ type Config struct {
 	LogLevel          string
 	BasicAuthUsername string
 	BasicAuthPassword string
+	AssistantAPIURL   string
 }
 
 // Load carrega configurações do ambiente
@@ -35,6 +36,7 @@ func Load() Config {
 		LogLevel:          getEnv("LOG_LEVEL", "INFO"),
 		BasicAuthUsername: getEnv("BASIC_AUTH_USERNAME", ""),
 		BasicAuthPassword: getEnv("BASIC_AUTH_PASSWORD", ""),
+		AssistantAPIURL:   getEnv("ASSISTANT_API_URL", "http://localhost:8000/api/v1"),
 	}
 }
 

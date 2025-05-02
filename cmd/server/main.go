@@ -37,11 +37,17 @@ func main() {
 		log.Fatalf("Erro ao criar gerenciador de WhatsApp: %v", err)
 	}
 
+	// Iniciar o gerenciador, incluindo processamento de webhooks
+	err = waMgr.Connect()
+	if err != nil {
+		log.Fatalf("Erro ao conectar gerenciador de WhatsApp: %v", err)
+	}
+	//Desnecessário, pois já está conectado no Connect()
 	// Tentar reconectar dispositivos existentes
-	go func() {
-		waMgr.ReconnectAllConnected()
-		waMgr.ConnectAllApproved()
-	}()
+	// go func() {
+	// 	waMgr.ReconnectAllConnected()
+	// 	waMgr.ConnectAllApproved()
+	// }()
 
 	// Configurar manipuladores de eventos globais
 	waMgr.AddEventHandler(func(deviceID int64, evt interface{}) {
