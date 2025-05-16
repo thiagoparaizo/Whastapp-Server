@@ -13,7 +13,7 @@ RUN go mod download
 COPY . .
 
 # Compilar a aplicação
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o whatsapp-service ./cmd/server
+#RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o whatsapp-service ./cmd/server
 
 # Estágio final
 FROM alpine:latest

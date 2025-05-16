@@ -25,8 +25,10 @@ type Config struct {
 func Load() Config {
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Erro ao carregar o arquivo .env")
+		log.Print("Erro ao carregar o arquivo .env")
 	}
+
+	log.Print("Carregando configurações...")
 
 	return Config{
 		Host:              getEnv("HOST", "0.0.0.0"),
