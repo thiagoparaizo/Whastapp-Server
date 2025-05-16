@@ -26,7 +26,7 @@ func main() {
 	}
 
 	// Conectar ao banco de dados
-	db, err := database.New(cfg.PostgresConnStr)
+	db, err := database.New(cfg.PostgresConnStr, cfg.AssistantAPIURL)
 	if err != nil {
 		log.Fatalf("Erro ao conectar ao banco de dados: %v | erro: %v", cfg.PostgresConnStr, err)
 	}
