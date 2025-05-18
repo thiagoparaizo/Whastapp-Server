@@ -91,42 +91,42 @@ func CreateTableQueries() []string {
         )`,
 
 		// Tabela de configurações de webhook
-		`CREATE TABLE IF NOT EXISTS webhook_configs (
-			id SERIAL PRIMARY KEY,
-			tenant_id INTEGER NOT NULL,
-			url VARCHAR(255) NOT NULL,
-			secret VARCHAR(255),
-			events TEXT[],
-			device_ids INTEGER[],
-			enabled BOOLEAN NOT NULL DEFAULT TRUE,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		)`,
+		// `CREATE TABLE IF NOT EXISTS webhook_configs (
+		// 	id SERIAL PRIMARY KEY,
+		// 	tenant_id INTEGER NOT NULL,
+		// 	url VARCHAR(255) NOT NULL,
+		// 	secret VARCHAR(255),
+		// 	events TEXT[],
+		// 	device_ids INTEGER[],
+		// 	enabled BOOLEAN NOT NULL DEFAULT TRUE,
+		// 	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		// 	updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		// )`,
 
-		// Tabela de entregas de webhook
-		`CREATE TABLE IF NOT EXISTS webhook_deliveries (
-			id SERIAL PRIMARY KEY,
-			webhook_id INTEGER NOT NULL,
-			event_type VARCHAR(100) NOT NULL,
-			payload TEXT NOT NULL,
-			response_code INTEGER,
-			response_body TEXT,
-			error_message TEXT,
-			attempt_count INTEGER NOT NULL DEFAULT 0,
-			status VARCHAR(20) NOT NULL,
-			next_retry_at TIMESTAMP,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			FOREIGN KEY (webhook_id) REFERENCES webhook_configs(id) ON DELETE CASCADE
-		)`,
+		// // Tabela de entregas de webhook
+		// `CREATE TABLE IF NOT EXISTS webhook_deliveries (
+		// 	id SERIAL PRIMARY KEY,
+		// 	webhook_id INTEGER NOT NULL,
+		// 	event_type VARCHAR(100) NOT NULL,
+		// 	payload TEXT NOT NULL,
+		// 	response_code INTEGER,
+		// 	response_body TEXT,
+		// 	error_message TEXT,
+		// 	attempt_count INTEGER NOT NULL DEFAULT 0,
+		// 	status VARCHAR(20) NOT NULL,
+		// 	next_retry_at TIMESTAMP,
+		// 	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		// 	last_updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		// 	FOREIGN KEY (webhook_id) REFERENCES webhook_configs(id) ON DELETE CASCADE
+		// )`,
 
 		// Índices para buscas rápidas
 		`CREATE INDEX IF NOT EXISTS idx_messages_device_jid ON whatsapp_messages(device_id, jid)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON whatsapp_messages(timestamp)`,
 		`CREATE INDEX IF NOT EXISTS idx_tracked_entities_device ON tracked_entities(device_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_webhook_configs_tenant ON webhook_configs(tenant_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status ON webhook_deliveries(status)`,
-		`CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_next_retry ON webhook_deliveries(next_retry_at)`,
+		// `CREATE INDEX IF NOT EXISTS idx_webhook_configs_tenant ON webhook_configs(tenant_id)`,
+		// `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status ON webhook_deliveries(status)`,
+		// `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_next_retry ON webhook_deliveries(next_retry_at)`,
 	}
 }
 

@@ -147,6 +147,7 @@ func (db *DB) UpdateDevice(device *WhatsAppDevice) error {
 			requires_reauth = $7
 		WHERE id = $8
 	`
+	// TODO: add device_name
 
 	_, err := db.Exec(
 		query,
@@ -159,6 +160,7 @@ func (db *DB) UpdateDevice(device *WhatsAppDevice) error {
 		device.RequiresReauth,
 		device.ID,
 	)
+	// TODO: add device.DeviceName
 
 	return err
 }
@@ -237,13 +239,13 @@ func (db *DB) SaveMessage(message *WhatsAppMessage) error {
 
 	// Após salvar a mensagem, notificar o Assistant API sobre o evento
 	// Este passo é assíncrono e não afeta o retorno da função
-	go db.notifyAssistantAboutMessage(message)
+	//go db.notifyAssistantAboutMessage(message)
 
 	return err
 }
 
 // notifyAssistantAboutMessage envia informações de mensagem para o Assistant API
-func (db *DB) notifyAssistantAboutMessage(message *WhatsAppMessage) {
+func (db *DB) NotifyAssistantAboutMessage(message *WhatsAppMessage) {
 	// Obter informações do dispositivo para resgatar o tenant_id
 	device, err := db.GetDeviceByID(message.DeviceID)
 	if err != nil || device == nil {
@@ -280,6 +282,7 @@ func (db *DB) notifyAssistantAboutMessage(message *WhatsAppMessage) {
 	}
 }
 
+// GetMessages obtém mensagens com base nos filtros
 // GetMessages obtém mensagens com base nos filtros
 func (db *DB) GetMessages(deviceID int64, jid string, filter string) ([]WhatsAppMessage, error) {
 	var messages []WhatsAppMessage
@@ -330,6 +333,11 @@ func (db *DB) GetMessages(deviceID int64, jid string, filter string) ([]WhatsApp
 		return nil, err
 	}
 
+	// Garantir que nunca retornamos null mesmo se não houver mensagens
+	if messages == nil {
+		messages = []WhatsAppMessage{}
+	}
+
 	return messages, nil
 }
 
@@ -337,6 +345,11 @@ func (db *DB) GetMessages(deviceID int64, jid string, filter string) ([]WhatsApp
 func (db *DB) GetTrackedEntities(deviceID int64) ([]TrackedEntity, error) {
 	var entities []TrackedEntity
 	err := db.Select(&entities, "SELECT * FROM tracked_entities WHERE device_id = $1", deviceID)
+	// Garantir que retornamos uma lista vazia e não null quando não há resultados
+	if entities == nil {
+		entities = []TrackedEntity{} // Inicializa como uma lista vazia
+	}
+
 	return entities, err
 }
 

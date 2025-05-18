@@ -42,14 +42,14 @@ func SetupRoutes(router *gin.Engine, handler *Handler) {
 			devices.DELETE("/:id/tracked/:jid", handler.DeleteTrackedEntity)
 		}
 
-		// Webhook
-		webhook := api.Group("/webhook")
-		{
-			webhook.POST("", handler.WebhookConfig)
-			webhook.GET("", handler.GetWebhookConfigs)
-			webhook.DELETE("/:id", handler.DeleteWebhookConfig)
-			webhook.POST("/:id/test", handler.TestWebhook)
-			webhook.GET("/:id/logs", handler.GetWebhookLogs)
-		}
+		// // Webhook
+		// webhook := api.Group("/webhook")
+		// {
+		// 	webhook.POST("", handler.WebhookConfig)
+		// 	webhook.GET("", handler.GetWebhookConfigs)
+		// 	webhook.DELETE("/:id", handler.DeleteWebhookConfig)
+		// 	webhook.POST("/:id/test", handler.TestWebhook)
+		// 	webhook.GET("/:id/logs", handler.GetWebhookLogs)
+		// }
 	}
 }

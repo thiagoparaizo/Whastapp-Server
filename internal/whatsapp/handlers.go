@@ -143,7 +143,10 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 	tracked, err := h.DB.GetTrackedEntity(deviceID, msg.Info.Chat.String())
 	if err != nil || !tracked.IsTracked {
 		fmt.Printf("Não salvar mensagens não trackeadas para contato/grupo %s: %v\n", msg.Info.Chat.String(), err)
-		return // Não salvar mensagens não trackeadas
+		if msg.Info.IsGroup {
+			return // Não salvar mensagens não trackeadas e não continuar com o restante do loop //TODO verificar se isso vai ficar mesmo assim
+		}
+
 	}
 
 	// Registrar mensagem no banco de dados
@@ -176,12 +179,44 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 		}
 	}
 
-	if err := h.DB.SaveMessage(message); err != nil {
-		fmt.Printf("Erro ao salvar mensagem: %v\n", err)
+	if msg.Info.IsGroup { //TODO verificar se isso vai ficar mesmo assim
+		if err := h.DB.SaveMessage(message); err != nil {
+			fmt.Printf("Erro ao salvar mensagem: %v\n", err)
+		}
+	} else { //TODO verificar se isso vai ficar mesmo assim
+		fmt.Printf("Não salvar mensagem: %v\n", err)
 	}
+
+	// Após salvar a mensagem, notificar o Assistant API sobre o evento
+	// Este passo é assíncrono e não afeta o retorno da função
+	go h.DB.NotifyAssistantAboutMessage(message)
 
 	fmt.Printf("Dispositivo %d recebeu mensagem de %s: %s\n", deviceID, message.Sender, message.Content)
 }
+
+// sendEventToAssistant envia um evento para o Assistant API
+// func (h *EventHandler) sendEventToAssistant(deviceID int64, evt interface{}) {
+// 	device, err := h.DB.GetDeviceByID(deviceID)
+// 	if err != nil || device == nil {
+// 		fmt.Printf("Erro ao buscar dispositivo para envio de evento ao Assistant: %d: %v\n", deviceID, err)
+// 		return
+// 	}
+
+// 	// Preparar dados do evento
+// 	event := map[string]interface{}{
+// 		"device_id":  deviceID,
+// 		"tenant_id":  device.TenantID,
+// 		"event_type": fmt.Sprintf("%T", evt),
+// 		"timestamp":  time.Now().Format(time.RFC3339),
+// 		"event":      evt,
+// 	}
+
+// 	// Enviar o evento para o Assistant API
+// 	err = h.DB.AssistantClient.SendWebhookEvent(event)
+// 	if err != nil {
+// 		fmt.Printf("Erro ao enviar evento para o Assistant API: %v\n", err)
+// 	}
+// }
 
 func getMessageTextContent(msg *events.Message) string {
 	if msg.Message.GetConversation() != "" {
