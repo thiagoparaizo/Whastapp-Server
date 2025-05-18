@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -81,7 +80,7 @@ func (m *Manager) GetClient(deviceID int64) (*Client, error) {
 	// Verificar se o dispositivo está aprovado ou conectado
 	if device.Status != database.DeviceStatusApproved &&
 		device.Status != database.DeviceStatusConnected {
-		return nil, fmt.Errorf("dispositivo não está aprovado para conexão")
+		return nil, fmt.Errorf("dispositivo não está aprovado para conexão ou já está conectado")
 	}
 
 	// Obtendo o dispositivo do whatsmeow
@@ -104,7 +103,7 @@ func (m *Manager) GetClient(deviceID int64) (*Client, error) {
 	}
 
 	// Criar cliente
-	client := NewClient(deviceID, device.TenantID, deviceStore, m.db, m.logger)
+	client := NewClient(deviceID, device.TenantID, deviceStore, m.db, m.logger) //TODOadd , device.deviceName string
 
 	// Adicionar handler global de eventos
 	client.AddEventHandler(func(evt interface{}) {
@@ -259,70 +258,71 @@ func (m *Manager) SendTestWebhook(url string, secret string, payload interface{}
 }
 
 // Iniciar worker de processamento de reenvio de webhooks
-func (m *Manager) StartWebhookProcessor() {
-	go func() {
-		// Processar a cada 30 segundos
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
+// func (m *Manager) StartWebhookProcessor() {
+// 	go func() {
+// 		// Processar a cada 30 segundos
+// 		ticker := time.NewTicker(30 * time.Second)
+// 		defer ticker.Stop()
 
-		for {
-			select {
-			case <-ticker.C:
-				if m.eventHandler != nil {
-					m.eventHandler.ProcessPendingWebhooks()
-				}
-			}
-		}
-	}()
-}
+// 		for {
+// 			select {
+// 			case <-ticker.C:
+// 				if m.eventHandler != nil {
+// 					m.eventHandler.ProcessPendingWebhooks()
+// 				}
+// 			}
+// 		}
+// 	}()
+// }
 
 func (m *Manager) Connect() error {
+	//IGNORANDO, POIS OS WEBHOOKS SÃO PROCESSADOS NA API
 	// Iniciar o serviço de processamento de webhooks em background
-	m.StartWebhookProcessor()
-	fmt.Println("Iniciado processador de webhooks pendentes")
+	//m.StartWebhookProcessor()
+	// fmt.Println("Iniciado processador de webhooks pendentes")
 
-	// Carregar configurações de webhook do banco de dados
-	if m.db != nil {
-		// Obter todos os tenants
-		allTenants, err := m.db.GetAllTenants()
-		if err != nil {
-			fmt.Printf("Erro ao buscar tenants: %v\n", err)
-		} else {
-			// Para cada tenant, verificar configurações de webhook
-			for _, tenant := range allTenants {
-				configs, err := m.db.GetWebhookConfigsByTenant(tenant["ID"].(int64))
-				if err != nil {
-					fmt.Printf("Erro ao buscar configurações para tenant %d: %v\n", tenant["ID"], err)
-					continue
-				}
+	// // Carregar configurações de webhook do banco de dados
+	// if m.db != nil {
+	// 	// Obter todos os tenants
+	// 	allTenants, err := m.db.GetAllTenants()
+	// 	if err != nil {
+	// 		fmt.Printf("Erro ao buscar tenants: %v\n", err)
+	// 	} else {
+	// 		// Para cada tenant, verificar configurações de webhook
+	// 		for _, tenant := range allTenants {
+	// 			configs, err := m.db.GetWebhookConfigsByTenant(tenant["ID"].(int64))
+	// 			if err != nil {
+	// 				fmt.Printf("Erro ao buscar configurações para tenant %d: %v\n", tenant["ID"], err)
+	// 				continue
+	// 			}
 
-				// Usar a primeira configuração ativa encontrada
-				var enabledConfig *WebhookConfig
-				for _, config := range configs {
-					if config.Enabled {
-						// Converter para o formato do webhook
-						enabledConfig = &WebhookConfig{
-							URL:       config.URL,
-							Secret:    config.Secret,
-							Events:    config.Events,
-							TenantID:  config.TenantID,
-							DeviceIDs: config.DeviceIDs,
-							Enabled:   config.Enabled,
-						}
-						break
-					}
-				}
+	// 			// Usar a primeira configuração ativa encontrada
+	// 			var enabledConfig *WebhookConfig
+	// 			for _, config := range configs {
+	// 				if config.Enabled {
+	// 					// Converter para o formato do webhook
+	// 					enabledConfig = &WebhookConfig{
+	// 						URL:       config.URL,
+	// 						Secret:    config.Secret,
+	// 						Events:    config.Events,
+	// 						TenantID:  config.TenantID,
+	// 						DeviceIDs: config.DeviceIDs,
+	// 						Enabled:   config.Enabled,
+	// 					}
+	// 					break
+	// 				}
+	// 			}
 
-				// Se encontrou configuração ativa, definir no event handler
-				if enabledConfig != nil {
-					fmt.Printf("Configurando webhook para tenant %d: %s\n", tenant["ID"], enabledConfig.URL)
-					if m.eventHandler != nil {
-						m.eventHandler.SetWebhookConfig(enabledConfig)
-					}
-				}
-			}
-		}
-	}
+	// 			// Se encontrou configuração ativa, definir no event handler
+	// 			if enabledConfig != nil {
+	// 				fmt.Printf("Configurando webhook para tenant %d: %s\n", tenant["ID"], enabledConfig.URL)
+	// 				if m.eventHandler != nil {
+	// 					m.eventHandler.SetWebhookConfig(enabledConfig)
+	// 				}
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 	// Conectar todos os dispositivos aprovados
 	fmt.Println("Iniciando conexão de dispositivos aprovados")
