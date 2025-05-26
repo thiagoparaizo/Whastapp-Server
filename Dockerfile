@@ -18,15 +18,23 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o whatsapp-service 
 # Estágio final
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates
+# Instalar dependências necessárias
+RUN apk --no-cache add \
+    ca-certificates \
+    ffmpeg \
+    && rm -rf /var/cache/apk/*
 
 WORKDIR /root/
 
 # Copiar o binário compilado do estágio de build
 COPY --from=builder /app/whatsapp-service .
 
-# Criar diretório para armazenamento de mídia
-RUN mkdir -p /root/storage/media
+# Criar diretórios necessários
+RUN mkdir -p /root/storage/media \
+    && mkdir -p /root/temp
+
+# Verificar se ffmpeg foi instalado corretamente
+RUN ffmpeg -version
 
 # Expor porta da API
 EXPOSE 8080

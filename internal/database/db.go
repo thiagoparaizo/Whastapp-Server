@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -176,10 +177,48 @@ func (db *DB) UpdateDeviceStatus(id int64, status DeviceStatus) error {
 
 // SetDeviceRequiresReauth marca um dispositivo como necessitando reautenticação
 func (db *DB) SetDeviceRequiresReauth(id int64) error {
-	_, err := db.Exec(
-		"UPDATE whatsapp_devices SET requires_reauth = true, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-		id,
-	)
+	// Verificar status atual antes de marcar para reauth
+	var currentStatus string
+	err := db.QueryRow("SELECT status FROM whatsapp_devices WHERE id = $1", id).Scan(&currentStatus)
+	if err != nil {
+		return err
+	}
+
+	// Não marcar dispositivos conectados para reauth automaticamente
+	if currentStatus == "connected" {
+		fmt.Printf("Dispositivo %d está conectado, não marcando para reauth automaticamente\n", id)
+		return nil
+	}
+
+	_, err = db.Exec(`
+		UPDATE whatsapp_devices 
+		SET requires_reauth = true, 
+			updated_at = CURRENT_TIMESTAMP 
+		WHERE id = $1 
+		AND status != 'connected'  -- Não marcar conectados
+		AND status != 'disabled'   -- Não mexer em desabilitados
+	`, id)
+
+	return err
+}
+
+// ClearDeviceSession limpa dados de sessão de um dispositivo (implementar se necessário)
+func (db *DB) ClearDeviceSession(deviceID int64) error {
+	fmt.Printf("Limpando sessão do dispositivo %d\n", deviceID)
+
+	// Atualizar dispositivo no banco de forma conservadora
+	_, err := db.Exec(`
+		UPDATE whatsapp_devices 
+		SET jid = NULL, 
+			requires_reauth = false, 
+			status = CASE 
+				WHEN status = 'connected' THEN 'approved'  -- Se estava conectado, volta para aprovado
+				ELSE status                                -- Mantém status atual para outros casos
+			END,
+			updated_at = CURRENT_TIMESTAMP 
+		WHERE id = $1
+	`, deviceID)
+
 	return err
 }
 
@@ -196,7 +235,16 @@ func (db *DB) GetAllDevicesByStatus(status DeviceStatus) ([]WhatsAppDevice, erro
 // GetDevicesRequiringReauth retorna todos os dispositivos que precisam ser reautenticados
 func (db *DB) GetDevicesRequiringReauth() ([]WhatsAppDevice, error) {
 	var devices []WhatsAppDevice
-	err := db.Select(&devices, "SELECT * FROM whatsapp_devices WHERE requires_reauth = true")
+
+	// Buscar apenas dispositivos que realmente precisam de reautenticação
+	// EXCLUIR dispositivos conectados
+	err := db.Select(&devices, `
+		SELECT * FROM whatsapp_devices 
+		WHERE requires_reauth = true 
+		AND status NOT IN ('connected', 'disabled')
+		ORDER BY updated_at ASC
+	`)
+
 	if err != nil {
 		return nil, err
 	}
@@ -272,6 +320,59 @@ func (db *DB) NotifyAssistantAboutMessage(message *WhatsAppMessage) {
 				"MediaType":    message.MediaType,
 			},
 		},
+	}
+
+	// Enviar para o Assistant API
+	err = db.AssistantClient.SendWebhookEvent(event)
+	if err != nil {
+		// Log do erro, mas não afeta o fluxo principal
+		fmt.Printf("Erro ao notificar Assistant sobre mensagem: %v\n", err)
+	}
+}
+
+// NotifyAssistantAboutMessageWithAudio envia informações de mensagem para o Assistant API com suporte a áudio
+func (db *DB) NotifyAssistantAboutMessageWithAudio(message *WhatsAppMessage, audioBase64 string) {
+	// Obter informações do dispositivo para resgatar o tenant_id
+	device, err := db.GetDeviceByID(message.DeviceID)
+	if err != nil || device == nil {
+		// Se não conseguir obter o dispositivo, não podemos notificar
+		return
+	}
+
+	// Criar evento base para enviar ao Assistant
+	event := map[string]interface{}{
+		"device_id":  message.DeviceID,
+		"tenant_id":  device.TenantID,
+		"event_type": "*events.Message",
+		"timestamp":  time.Now().Format(time.RFC3339),
+		"event": map[string]interface{}{
+			"Info": map[string]interface{}{
+				"Chat":     message.JID,
+				"Sender":   message.Sender,
+				"IsFromMe": message.IsFromMe,
+				"IsGroup":  message.IsGroup,
+			},
+			"Message": map[string]interface{}{
+				"Conversation": message.Content,
+				"MediaURL":     message.MediaURL,
+				"MediaType":    message.MediaType,
+			},
+		},
+	}
+
+	// Se há áudio em base64, adicionar ao evento
+	if audioBase64 != "" {
+		// Adicionar o áudio ao evento como um campo especial
+		event["audio_data"] = map[string]interface{}{
+			"base64":     audioBase64,
+			"format":     "mp3",
+			"message_id": message.MessageID,
+		}
+
+		// Marcar que esta mensagem contém áudio processado
+		eventMessage := event["event"].(map[string]interface{})["Message"].(map[string]interface{})
+		eventMessage["HasProcessedAudio"] = true
+		eventMessage["AudioFormat"] = "mp3"
 	}
 
 	// Enviar para o Assistant API
@@ -787,4 +888,132 @@ func (db *DB) GetWebhookLogs(webhookID int64, status string, limit int) ([]Webho
 	}
 
 	return logs, nil
+}
+
+// Método para verificar inconsistências sem corrigir automaticamente
+func (db *DB) CheckDeviceConsistency() ([]map[string]interface{}, error) {
+	rows, err := db.Query(`
+		SELECT 
+			d.id,
+			d.name,
+			d.status,
+			d.jid,
+			d.requires_reauth,
+			CASE WHEN w.jid IS NOT NULL THEN true ELSE false END as has_whatsmeow_session
+		FROM whatsapp_devices d
+		LEFT JOIN whatsmeow_device w ON d.jid = w.jid
+		WHERE d.status != 'disabled'
+		ORDER BY d.id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+
+	for rows.Next() {
+		var id int64
+		var name, status string
+		var jid sql.NullString
+		var requiresReauth, hasWhatsmeowSession bool
+
+		if err := rows.Scan(&id, &name, &status, &jid, &requiresReauth, &hasWhatsmeowSession); err != nil {
+			continue
+		}
+
+		// Identificar inconsistências
+		inconsistency := ""
+		needsAction := false
+
+		if status == "connected" && !hasWhatsmeowSession {
+			inconsistency = "Conectado no banco mas sem sessão no whatsmeow"
+			needsAction = true
+		} else if jid.Valid && !hasWhatsmeowSession {
+			inconsistency = "Tem JID no banco mas sem sessão no whatsmeow"
+			needsAction = true
+		} else if requiresReauth && status == "connected" {
+			inconsistency = "Conectado mas marcado para reautenticação"
+			needsAction = false // Pode ser normal
+		}
+
+		jidString := ""
+		if jid.Valid {
+			jidString = jid.String
+		}
+
+		result := map[string]interface{}{
+			"device_id":             id,
+			"name":                  name,
+			"status":                status,
+			"jid":                   jidString,
+			"requires_reauth":       requiresReauth,
+			"has_whatsmeow_session": hasWhatsmeowSession,
+			"inconsistency":         inconsistency,
+			"needs_action":          needsAction,
+		}
+
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+// Método para correção manual de dispositivo específico
+func (db *DB) FixSpecificDevice(deviceID int64, action string) error {
+	switch action {
+	case "clear_session":
+		return db.ClearDeviceSession(deviceID)
+
+	case "reset_reauth":
+		_, err := db.Exec(`
+			UPDATE whatsapp_devices 
+			SET requires_reauth = false,
+				updated_at = CURRENT_TIMESTAMP 
+			WHERE id = $1
+		`, deviceID)
+		return err
+
+	case "force_approved":
+		_, err := db.Exec(`
+			UPDATE whatsapp_devices 
+			SET status = 'approved',
+				jid = NULL,
+				requires_reauth = false,
+				updated_at = CURRENT_TIMESTAMP 
+			WHERE id = $1
+		`, deviceID)
+		return err
+
+	default:
+		return fmt.Errorf("ação não reconhecida: %s", action)
+	}
+}
+
+// GetConnectedDevicesWithoutClients busca dispositivos conectados que não têm cliente ativo
+func (db *DB) GetConnectedDevicesWithoutClients(activeClientIDs []int64) ([]WhatsAppDevice, error) {
+	if len(activeClientIDs) == 0 {
+		// Se não há clientes ativos, retornar todos os conectados
+		var devices []WhatsAppDevice
+		err := db.Select(&devices, "SELECT * FROM whatsapp_devices WHERE status = 'connected'")
+		return devices, err
+	}
+
+	// Criar placeholders para a query
+	placeholders := make([]string, len(activeClientIDs))
+	args := make([]interface{}, len(activeClientIDs))
+	for i, id := range activeClientIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+		SELECT * FROM whatsapp_devices 
+		WHERE status = 'connected' 
+		AND id NOT IN (%s)
+	`, strings.Join(placeholders, ","))
+
+	var devices []WhatsAppDevice
+	err := db.Select(&devices, query, args...)
+	return devices, err
 }

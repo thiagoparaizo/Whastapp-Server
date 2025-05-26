@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -38,16 +39,16 @@ func main() {
 	}
 
 	// Iniciar o gerenciador, incluindo processamento de webhooks
-	err = waMgr.Connect()
+	// Inicializar manager com limpeza //TODO validar
+	err = waMgr.InitializeWithCleanup()
 	if err != nil {
-		log.Fatalf("Erro ao conectar gerenciador de WhatsApp: %v", err)
+		log.Fatalf("Erro ao inicializar manager: %v", err)
 	}
-	//Desnecessário, pois já está conectado no Connect()
-	// Tentar reconectar dispositivos existentes
-	// go func() {
-	// 	waMgr.ReconnectAllConnected()
-	// 	waMgr.ConnectAllApproved()
-	// }()
+	// metodo anterior de inicialização
+	// err = waMgr.Connect()
+	// if err != nil {
+	// 	log.Fatalf("Erro ao conectar gerenciador de WhatsApp: %v", err)
+	// }
 
 	// Configurar manipuladores de eventos globais
 	waMgr.AddEventHandler(func(deviceID int64, evt interface{}) {
@@ -78,6 +79,16 @@ func main() {
 		addr := fmt.Sprintf("%s:%s", cfg.Host, cfg.Port)
 		if err := router.Run(addr); err != nil {
 			log.Fatalf("Erro ao iniciar servidor: %v", err)
+		}
+	}()
+
+	// Agendar verificação de saúde periódica
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			waMgr.HealthCheckClients()
 		}
 	}()
 

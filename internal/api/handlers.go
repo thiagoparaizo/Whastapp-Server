@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -85,6 +86,7 @@ func (h *Handler) CreateDevice(c *gin.Context) {
 		Name        string `json:"name" binding:"required"`
 		Description string `json:"description"`
 		PhoneNumber string `json:"phone_number"`
+		//TODO DeviceName	string `json:"device_name"`
 	}
 
 	if err := c.ShouldBindJSON(&request); err != nil {
@@ -98,6 +100,7 @@ func (h *Handler) CreateDevice(c *gin.Context) {
 		Description: request.Description,
 		PhoneNumber: request.PhoneNumber,
 		Status:      database.DeviceStatusPending, // Pendente de aprovação
+		//TODO DeviceName:  request.DeviceName,
 	}
 
 	err := h.DB.CreateDevice(device)
@@ -186,14 +189,31 @@ func (h *Handler) GetQRCode(c *gin.Context) {
 	}
 
 	if device.Status != database.DeviceStatusApproved {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Dispositivo não está aprovado para conexão"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Dispositivo não está aprovado para conexão ou já está conectado!"})
 		return
+	}
+
+	if device.RequiresReauth {
+		// Limpar dados de sessão antes de gerar novo QR
+		fmt.Printf("Dispositivo %d necessita reautenticação, limpando sessão\n", id)
+
+		// Remover cliente da memória se existir
+		h.WhatsAppMgr.DisconnectClient(id)
+
+		// Limpar JID do banco de dados
+		device.JID = sql.NullString{Valid: false}
+		device.RequiresReauth = false // Reset flag após limpeza
+		err = h.DB.UpdateDevice(device)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Erro ao limpar sessão"})
+			return
+		}
 	}
 
 	// Obter cliente
 	client, err := h.WhatsAppMgr.GetClient(id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Erro ao obter cliente: %v", err)})
 		return
 	}
 
@@ -221,12 +241,36 @@ func (h *Handler) GetQRCode(c *gin.Context) {
 		return
 	}
 
+	// Obter canal para o código QR
+	ctx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	qrChan, err = client.GetQRChannel(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Erro ao obter canal QR: %v", err)})
+		return
+	}
+
+	// Conectar cliente ao WhatsApp (isso deve gerar o QR)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("Panic ao conectar para QR do dispositivo %d: %v\n", id, r)
+			}
+		}()
+
+		err := client.Connect()
+		if err != nil {
+			fmt.Printf("Erro ao conectar para QR do dispositivo %d: %v\n", id, err)
+		}
+	}()
+
 	// Aguardar pelo código QR ou timeout
 	select {
 	case qr := <-qrChan:
 		c.JSON(http.StatusOK, gin.H{"qr_code": qr})
 	case <-ctx.Done():
-		c.JSON(http.StatusRequestTimeout, gin.H{"error": "Timeout ao aguardar código QR"})
+		c.JSON(http.StatusRequestTimeout, gin.H{"error": "Timeout ao aguardar código QR (60s)"})
 	}
 }
 
@@ -918,4 +962,191 @@ func (h *Handler) GetWebhookLogs(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, logs)
+}
+
+// GetSystemStatus retorna status detalhado do sistema
+func (h *Handler) GetSystemStatus(c *gin.Context) {
+	// Status dos clientes em memória
+	managerStatus := h.WhatsAppMgr.GetDetailedStatus()
+
+	// Verificar consistência do banco
+	consistency, err := h.DB.CheckDeviceConsistency()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// CORREÇÃO: Obter IDs dos clientes ativos de forma mais segura
+	activeClientIDs := make([]int64, 0)
+
+	// Converter interface{} para map[string]interface{}
+	if devicesInterface, exists := managerStatus["devices"]; exists {
+		if devices, ok := devicesInterface.([]map[string]interface{}); ok {
+			for _, device := range devices {
+				if deviceID, ok := device["device_id"].(int64); ok {
+					activeClientIDs = append(activeClientIDs, deviceID)
+				}
+			}
+		}
+	}
+
+	// Buscar dispositivos conectados sem clientes
+	orphanDevices, err := h.DB.GetConnectedDevicesWithoutClients(activeClientIDs)
+	if err != nil {
+		orphanDevices = []database.WhatsAppDevice{} // Continue mesmo com erro
+	}
+
+	response := map[string]interface{}{
+		"timestamp":       time.Now().Format(time.RFC3339),
+		"manager_status":  managerStatus,
+		"consistency":     consistency,
+		"orphan_devices":  orphanDevices,
+		"recommendations": generateRecommendations(consistency, orphanDevices),
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// FixDeviceIssue corrige problemas específicos de dispositivos
+func (h *Handler) FixDeviceIssue(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID inválido"})
+		return
+	}
+
+	var request struct {
+		Action string `json:"action" binding:"required"` // clear_session, reset_reauth, force_approved
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validar ações permitidas
+	allowedActions := map[string]string{
+		"clear_session":  "Limpar sessão e resetar para aprovado",
+		"reset_reauth":   "Remover flag de reautenticação",
+		"force_approved": "Forçar status aprovado e limpar dados",
+		"disconnect":     "Desconectar cliente da memória",
+	}
+
+	if _, valid := allowedActions[request.Action]; !valid {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":           "Ação inválida",
+			"allowed_actions": allowedActions,
+		})
+		return
+	}
+
+	// Executar ação
+	switch request.Action {
+	case "disconnect":
+		// CORREÇÃO: Usar método que existe
+		err = h.WhatsAppMgr.DisconnectClient(id)
+		if err != nil {
+			// Se não conseguir desconectar, não é erro crítico
+			fmt.Printf("Aviso: não foi possível desconectar cliente %d: %v\n", id, err)
+		}
+
+		// Também limpar sessão no banco
+		err = h.DB.ClearDeviceSession(id)
+
+	default:
+		// Ações do banco de dados
+		err = h.DB.FixSpecificDevice(id, request.Action)
+	}
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Retornar status atualizado
+	device, err := h.DB.GetDeviceByID(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Erro ao buscar dispositivo atualizado"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":      "success",
+		"action":      request.Action,
+		"description": allowedActions[request.Action],
+		"device":      device,
+	})
+}
+
+// ReconnectDevice força reconexão de um dispositivo específico
+func (h *Handler) ReconnectDevice(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ID inválido"})
+		return
+	}
+
+	// Verificar se dispositivo existe
+	device, err := h.DB.GetDeviceByID(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if device == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Dispositivo não encontrado"})
+		return
+	}
+
+	// Verificar se tem dados para reconectar
+	if !device.JID.Valid || device.JID.String == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":      "Dispositivo não tem JID válido",
+			"suggestion": "Gere um novo QR Code",
+		})
+		return
+	}
+
+	// Tentar reconectar usando método que existe
+	go func() {
+		err := h.WhatsAppMgr.ConnectClient(id)
+		if err != nil {
+			fmt.Printf("Erro na reconexão forçada do dispositivo %d: %v\n", id, err)
+		} else {
+			fmt.Printf("Dispositivo %d reconectado com sucesso\n", id)
+		}
+	}()
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "reconnection_started",
+		"device_id": id,
+		"message":   "Tentativa de reconexão iniciada em background",
+	})
+}
+
+// Função auxiliar para gerar recomendações
+func generateRecommendations(consistency []map[string]interface{}, orphanDevices []database.WhatsAppDevice) []string {
+	var recommendations []string
+
+	for _, item := range consistency {
+		if needsAction, ok := item["needs_action"].(bool); ok && needsAction {
+			deviceID := item["device_id"]
+			inconsistency := item["inconsistency"]
+			recommendations = append(recommendations,
+				fmt.Sprintf("Dispositivo %v: %v - Requer ação manual", deviceID, inconsistency))
+		}
+	}
+
+	if len(orphanDevices) > 0 {
+		recommendations = append(recommendations,
+			fmt.Sprintf("%d dispositivos conectados no banco sem clientes ativos", len(orphanDevices)))
+	}
+
+	if len(recommendations) == 0 {
+		recommendations = append(recommendations, "Sistema funcionando normalmente")
+	}
+
+	return recommendations
 }

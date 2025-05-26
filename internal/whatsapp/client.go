@@ -33,7 +33,13 @@ type Client struct {
 
 // NewClient cria um novo cliente WhatsApp
 func NewClient(deviceID int64, tenantID int64, deviceStore *store.Device, db *database.DB, logger waLog.Logger) *Client {
+	//TODO func NewClient(deviceID int64, tenantID int64, deviceStore *store.Device, db *database.DB, logger waLog.Logger, deviceName string) *Client {
+
 	waClient := whatsmeow.NewClient(deviceStore, logger)
+	// Configurar propriedades do dispositivo
+	//waClient.Store.CompanionProps.Os = proto.String(deviceName)
+	//arquivo interno que seta o nome do dispositivo (linha 127)
+	//C:\Users\thiago.paraizo\go\pkg\mod\go.mau.fi\whatsmeow@v0.0.0-20250424100714-086604102f64\store\clientpayload.go
 
 	client := &Client{
 		Client:        waClient,
@@ -105,8 +111,16 @@ func (c *Client) IsConnected() bool {
 
 // GetQRChannel obtém um canal para receber o código QR
 func (c *Client) GetQRChannel(ctx context.Context) (<-chan string, error) {
+	if c.Client == nil {
+		return nil, fmt.Errorf("cliente WhatsApp não inicializado")
+	}
+
+	if c.Client.Store == nil {
+		return nil, fmt.Errorf("store do cliente não inicializado")
+	}
+
 	if c.Client.Store.ID != nil {
-		return nil, fmt.Errorf("dispositivo já está conectado")
+		return nil, fmt.Errorf("dispositivo já está conectado/autenticado")
 	}
 
 	c.mutex.Lock()
@@ -339,7 +353,6 @@ func (c *Client) SendGroupMessage(groupID string, text string) (string, error) {
 	return resp.ID, nil
 }
 
-// SendMediaMessage envia uma mensagem com mídia para um contato ou grupo
 // SendMediaMessage envia uma mensagem com mídia para um contato ou grupo
 func (c *Client) SendMediaMessage(to string, mediaType string, data []byte, caption string) (string, error) {
 	if !c.IsConnected() {

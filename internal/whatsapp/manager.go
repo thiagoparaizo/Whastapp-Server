@@ -3,8 +3,11 @@ package whatsapp
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -23,6 +26,42 @@ type Manager struct {
 	mutex         sync.Mutex
 	eventHandlers []func(deviceID int64, evt interface{})
 	eventHandler  *EventHandler
+}
+
+// GetDetailedStatus retorna status detalhado do manager
+func (m *Manager) GetDetailedStatus() map[string]interface{} {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	status := map[string]interface{}{
+		"clients_in_memory": len(m.clients),
+		"devices":           make([]map[string]interface{}, 0),
+	}
+
+	for deviceID, client := range m.clients {
+		deviceStatus := map[string]interface{}{
+			"device_id": deviceID,
+			"connected": false,
+			"has_store": false,
+			"jid":       "",
+		}
+
+		if client != nil {
+			deviceStatus["connected"] = client.IsConnected()
+
+			if client.Client != nil {
+				deviceStatus["has_store"] = client.Client.Store != nil
+
+				if client.Client.Store != nil && client.Client.Store.ID != nil {
+					deviceStatus["jid"] = client.Client.Store.ID.String()
+				}
+			}
+		}
+
+		status["devices"] = append(status["devices"].([]map[string]interface{}), deviceStatus)
+	}
+
+	return status
 }
 
 // NewManager cria um novo gerenciador de clientes
@@ -85,21 +124,40 @@ func (m *Manager) GetClient(deviceID int64) (*Client, error) {
 
 	// Obtendo o dispositivo do whatsmeow
 	var deviceStore *store.Device
-	if device.JID.Valid {
-		// Se já tem JID, usar para recuperar o dispositivo
+	var needsReauth bool = false
+	if device.JID.Valid && device.JID.String != "" {
+		// Dispositivo tem JID, tentar recuperar sessão
 		wajid, err := types.ParseJID(device.JID.String)
 		if err != nil {
-			return nil, fmt.Errorf("JID inválido: %w", err)
+			fmt.Printf("JID inválido para dispositivo %d: %v\n", deviceID, err)
+			needsReauth = true
+		} else {
+			// Tentar obter sessão existente
+			deviceStore, err = m.container.GetDevice(wajid)
+			if err != nil || deviceStore == nil {
+				fmt.Printf("Sessão não encontrada para dispositivo %d (JID: %s)\n", deviceID, device.JID.String)
+				needsReauth = true
+			}
 		}
+	}
 
-		deviceStore, err = m.container.GetDevice(wajid)
-		if err != nil {
-			// Se não conseguir recuperar, criar um novo
-			deviceStore = m.container.NewDevice()
-		}
-	} else {
-		// Se não tem JID, criar um novo dispositivo
+	// Se não conseguiu recuperar sessão ou não tem JID, criar nova
+	if deviceStore == nil || needsReauth {
+		fmt.Printf("Criando nova sessão para dispositivo %d\n", deviceID)
 		deviceStore = m.container.NewDevice()
+
+		// Se tinha JID mas perdeu a sessão, marcar para reautenticação
+		if device.JID.Valid && device.JID.String != "" {
+			fmt.Printf("Dispositivo %d perdeu sessão, marcando para reautenticação\n", deviceID)
+
+			// Limpar JID do dispositivo no banco
+			device.JID = sql.NullString{Valid: false}
+			device.RequiresReauth = true
+			err = m.db.UpdateDevice(device)
+			if err != nil {
+				fmt.Printf("Erro ao atualizar dispositivo para reauth: %v\n", err)
+			}
+		}
 	}
 
 	// Criar cliente
@@ -120,12 +178,13 @@ func (m *Manager) GetClient(deviceID int64) (*Client, error) {
 
 // ConnectClient conecta um cliente específico
 func (m *Manager) ConnectClient(deviceID int64) error {
-	client, err := m.GetClient(deviceID)
-	if err != nil {
-		return err
-	}
+	// client, err := m.GetClient(deviceID)
+	// if err != nil {
+	// 	return err
+	// }
 
-	return client.Connect()
+	// return client.Connect()
+	return m.ConnectClientSafely(deviceID)
 }
 
 // DisconnectClient desconecta um cliente específico
@@ -170,43 +229,375 @@ func (m *Manager) AddEventHandler(handler func(deviceID int64, evt interface{}))
 	m.eventHandlers = append(m.eventHandlers, handler)
 }
 
-// ConnectAllApproved conecta todos os dispositivos aprovados
+// // ConnectAllApproved conecta todos os dispositivos aprovados
+// func (m *Manager) ConnectAllApproved() {
+// 	devices, err := m.db.GetAllDevicesByStatus(database.DeviceStatusApproved)
+// 	if err != nil {
+// 		fmt.Printf("Erro ao buscar dispositivos aprovados: %v\n", err)
+// 		return
+// 	}
+
+// 	for _, device := range devices {
+// 		// Tentar conectar em uma goroutine separada
+// 		go func(d database.WhatsAppDevice) {
+// 			err := m.ConnectClient(d.ID)
+// 			if err != nil {
+// 				fmt.Printf("Erro ao conectar dispositivo %d: %v\n", d.ID, err)
+// 			}
+// 		}(device)
+// 	}
+// }
+
+// ConnectAllApproved conecta todos os dispositivos aprovados com tratamento de erro robusto
 func (m *Manager) ConnectAllApproved() {
-	devices, err := m.db.GetAllDevicesByStatus(database.DeviceStatusApproved)
+	fmt.Println("Iniciando conexão de dispositivos...")
+
+	// Buscar dispositivos que podem ser conectados
+	devices, err := m.db.Query(`
+		SELECT id, name, status, jid, requires_reauth
+		FROM whatsapp_devices 
+		WHERE status IN ('approved', 'connected') 
+		AND status != 'disabled'
+		ORDER BY updated_at DESC
+	`)
 	if err != nil {
-		fmt.Printf("Erro ao buscar dispositivos aprovados: %v\n", err)
+		fmt.Printf("Erro ao buscar dispositivos: %v\n", err)
 		return
 	}
+	defer devices.Close()
 
-	for _, device := range devices {
-		// Tentar conectar em uma goroutine separada
+	var approvedDevices, connectedDevices []database.WhatsAppDevice
+
+	for devices.Next() {
+		var device database.WhatsAppDevice
+		if err := devices.Scan(&device.ID, &device.Name, &device.Status, &device.JID, &device.RequiresReauth); err != nil {
+			continue
+		}
+
+		if device.Status == database.DeviceStatusApproved {
+			approvedDevices = append(approvedDevices, device)
+		} else if device.Status == database.DeviceStatusConnected {
+			connectedDevices = append(connectedDevices, device)
+		}
+	}
+
+	fmt.Printf("Encontrados %d dispositivos aprovados e %d conectados\n",
+		len(approvedDevices), len(connectedDevices))
+
+	// Usar um semáforo para limitar conexões simultâneas
+	semaphore := make(chan struct{}, 2) // Máximo 2 conexões simultâneas
+
+	// Primeiro, tentar reconectar dispositivos que estavam conectados
+	for _, device := range connectedDevices {
 		go func(d database.WhatsAppDevice) {
-			err := m.ConnectClient(d.ID)
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			fmt.Printf("Tentando reconectar dispositivo %d (%s)\n", d.ID, d.Name)
+
+			err := m.ConnectClientSafely(d.ID)
 			if err != nil {
-				fmt.Printf("Erro ao conectar dispositivo %d: %v\n", d.ID, err)
+				fmt.Printf("Erro ao reconectar dispositivo %d (%s): %v\n", d.ID, d.Name, err)
+
+				// Se falhar na reconexão, marcar como approved para permitir novo QR
+				if m.isCriticalConnectionError(err) {
+					fmt.Printf("Erro crítico na reconexão, marcando dispositivo %d como approved\n", d.ID)
+					m.db.UpdateDeviceStatus(d.ID, database.DeviceStatusApproved)
+				}
+			} else {
+				fmt.Printf("Dispositivo %d (%s) reconectado com sucesso\n", d.ID, d.Name)
 			}
 		}(device)
 	}
+
+	// Depois, conectar dispositivos aprovados que nunca foram conectados
+	for _, device := range approvedDevices {
+		// Só tentar conectar se tem JID válido
+		if device.JID.Valid && device.JID.String != "" && !device.RequiresReauth {
+			go func(d database.WhatsAppDevice) {
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
+
+				fmt.Printf("Tentando conectar dispositivo aprovado %d (%s)\n", d.ID, d.Name)
+
+				err := m.ConnectClientSafely(d.ID)
+				if err != nil {
+					fmt.Printf("Erro ao conectar dispositivo aprovado %d (%s): %v\n", d.ID, d.Name, err)
+				} else {
+					fmt.Printf("Dispositivo aprovado %d (%s) conectado com sucesso\n", d.ID, d.Name)
+				}
+			}(device)
+		} else {
+			fmt.Printf("Dispositivo %d (%s) aguardando QR Code (sem JID ou requer reauth)\n",
+				device.ID, device.Name)
+		}
+	}
+}
+
+// ConnectClientSafely conecta um cliente com tratamento de erro mais robusto
+func (m *Manager) ConnectClientSafely(deviceID int64) error {
+	fmt.Printf("Tentando conectar dispositivo %d\n", deviceID)
+
+	// Verificar se já existe e está conectado
+	m.mutex.Lock()
+	if client, exists := m.clients[deviceID]; exists {
+		if client.IsConnected() {
+			m.mutex.Unlock()
+			fmt.Printf("Dispositivo %d já está conectado\n", deviceID)
+			return nil
+		}
+
+		// Se existe mas não está conectado, remover
+		fmt.Printf("Removendo cliente desconectado para dispositivo %d\n", deviceID)
+		delete(m.clients, deviceID)
+	}
+	m.mutex.Unlock()
+
+	// Usar GetClient que já tem toda a lógica necessária
+	client, err := m.GetClient(deviceID)
+	if err != nil {
+		return fmt.Errorf("erro ao obter/criar cliente: %w", err)
+	}
+
+	// Tentar conectar com timeout
+	connectChan := make(chan error, 1)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				connectChan <- fmt.Errorf("panic durante conexão: %v", r)
+			}
+		}()
+
+		err := client.Connect()
+		connectChan <- err
+	}()
+
+	// Aguardar conexão com timeout de 30 segundos
+	select {
+	case err := <-connectChan:
+		if err != nil {
+			// Remover cliente com falha
+			m.mutex.Lock()
+			delete(m.clients, deviceID)
+			m.mutex.Unlock()
+			return fmt.Errorf("erro na conexão: %w", err)
+		}
+		fmt.Printf("Dispositivo %d conectado com sucesso\n", deviceID)
+		return nil
+	case <-time.After(30 * time.Second):
+		// Timeout - remover cliente
+		m.mutex.Lock()
+		delete(m.clients, deviceID)
+		m.mutex.Unlock()
+		return fmt.Errorf("timeout na conexão após 30 segundos")
+	}
+}
+
+// createClientWithRetry cria um cliente com tentativas de retry
+func (m *Manager) createClientWithRetry(deviceID int64, maxRetries int) (*Client, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		fmt.Printf("Tentativa %d/%d de criar cliente para dispositivo %d\n", attempt, maxRetries, deviceID)
+
+		client, err := m.GetClient(deviceID)
+		if err == nil {
+			return client, nil
+		}
+
+		lastErr = err
+		fmt.Printf("Falha na tentativa %d para dispositivo %d: %v\n", attempt, deviceID, err)
+
+		if attempt < maxRetries {
+			// Aguardar antes da próxima tentativa
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+	}
+
+	return nil, fmt.Errorf("falha após %d tentativas: %w", maxRetries, lastErr)
+}
+
+// isCriticalConnectionError verifica se um erro de conexão é crítico
+func (m *Manager) isCriticalConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errorStr := err.Error()
+
+	// Erros que indicam necessidade de reautenticação
+	criticalErrors := []string{
+		"invalid memory address",
+		"nil pointer dereference",
+		"session not found",
+		"invalid session",
+		"unauthorized",
+		"logged out",
+		"connection refused",
+		"handshake failed",
+	}
+
+	for _, criticalErr := range criticalErrors {
+		if strings.Contains(strings.ToLower(errorStr), criticalErr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Método auxiliar para limpeza de sessões corrompidas
+func (m *Manager) CleanCorruptedSessions() error {
+	fmt.Println("Verificando sessões para limpeza...")
+
+	// CORREÇÃO: Buscar apenas dispositivos com problemas reais
+	// NÃO limpar dispositivos conectados que só têm requires_reauth=true
+	devices, err := m.db.Query(`
+		SELECT id, jid, name, status, requires_reauth 
+		FROM whatsapp_devices 
+		WHERE requires_reauth = true 
+		AND status NOT IN ('connected')  -- NÃO limpar dispositivos conectados
+		AND status != 'disabled'        -- NÃO mexer em dispositivos desabilitados
+	`)
+	if err != nil {
+		return fmt.Errorf("erro ao buscar dispositivos para limpeza: %w", err)
+	}
+	defer devices.Close()
+
+	var cleanedCount int
+	for devices.Next() {
+		var deviceID int64
+		var jid sql.NullString
+		var name, status string
+		var requiresReauth bool
+
+		if err := devices.Scan(&deviceID, &jid, &name, &status, &requiresReauth); err != nil {
+			continue
+		}
+
+		fmt.Printf("Analisando dispositivo %d (%s) - Status: %s, Reauth: %v\n",
+			deviceID, name, status, requiresReauth)
+
+		// Verificar se realmente precisa de limpeza
+		needsCleaning := false
+
+		if jid.Valid && jid.String != "" {
+			// Verificar se a sessão existe no whatsmeow
+			wajid, err := types.ParseJID(jid.String)
+			if err != nil {
+				fmt.Printf("JID inválido para dispositivo %d: %v\n", deviceID, err)
+				needsCleaning = true
+			} else {
+				// Tentar obter sessão
+				deviceStore, err := m.container.GetDevice(wajid)
+				if err != nil || deviceStore == nil {
+					fmt.Printf("Sessão não encontrada no whatsmeow para dispositivo %d\n", deviceID)
+					needsCleaning = true
+				}
+			}
+		} else if status == "approved" {
+			// Dispositivo aprovado sem JID é normal, não precisa limpeza
+			fmt.Printf("Dispositivo %d aprovado sem JID - normal\n", deviceID)
+		}
+
+		if needsCleaning {
+			fmt.Printf("Limpando sessão corrompida do dispositivo %d (%s)\n", deviceID, name)
+
+			// Remover cliente da memória se existir
+			if client, exists := m.clients[deviceID]; exists {
+				if client.Client != nil {
+					client.Client.Disconnect()
+				}
+				delete(m.clients, deviceID)
+			}
+
+			// Limpar dados de sessão do banco
+			err := m.db.ClearDeviceSession(deviceID)
+			if err != nil {
+				fmt.Printf("Erro ao limpar sessão do dispositivo %d: %v\n", deviceID, err)
+			} else {
+				cleanedCount++
+			}
+		} else {
+			fmt.Printf("Dispositivo %d não precisa de limpeza\n", deviceID)
+		}
+	}
+
+	if cleanedCount > 0 {
+		fmt.Printf("Limpeza concluída: %d dispositivos limpos\n", cleanedCount)
+	} else {
+		fmt.Printf("Nenhum dispositivo precisou de limpeza\n")
+	}
+
+	return nil
+}
+
+// Método para verificar saúde dos clientes conectados
+func (m *Manager) HealthCheckClients() {
+	fmt.Println("Verificando saúde dos clientes conectados...")
+
+	for deviceID, client := range m.clients {
+		if client == nil || client.Client == nil {
+			fmt.Printf("Cliente inválido encontrado para dispositivo %d, removendo\n", deviceID)
+			delete(m.clients, deviceID)
+			continue
+		}
+
+		if !client.IsConnected() {
+			fmt.Printf("Cliente desconectado encontrado para dispositivo %d, removendo\n", deviceID)
+			delete(m.clients, deviceID)
+
+			// Atualizar status no banco
+			device, err := m.db.GetDeviceByID(deviceID)
+			if err == nil && device != nil {
+				device.Status = database.DeviceStatusApproved
+				device.RequiresReauth = true
+				m.db.UpdateDevice(device)
+			}
+		}
+	}
+}
+
+// Adicionar ao método de inicialização do Manager
+func (m *Manager) InitializeWithCleanup() error {
+	fmt.Println("Inicializando Manager com limpeza...")
+
+	// Primeiro, limpar sessões corrompidas
+	if err := m.CleanCorruptedSessions(); err != nil {
+		fmt.Printf("Aviso: erro na limpeza de sessões: %v\n", err)
+	}
+
+	// Verificar saúde dos clientes
+	m.HealthCheckClients()
+
+	// Aguardar um pouco antes de tentar reconectar
+	time.Sleep(2 * time.Second)
+
+	// Conectar dispositivos aprovados
+	m.ConnectAllApproved()
+
+	return nil
 }
 
 // ReconnectAllConnected tenta reconectar todos os dispositivos que estavam conectados
-func (m *Manager) ReconnectAllConnected() {
-	devices, err := m.db.GetAllDevicesByStatus(database.DeviceStatusConnected)
-	if err != nil {
-		fmt.Printf("Erro ao buscar dispositivos conectados: %v\n", err)
-		return
-	}
+// func (m *Manager) ReconnectAllConnected() {
+// 	devices, err := m.db.GetAllDevicesByStatus(database.DeviceStatusConnected)
+// 	if err != nil {
+// 		fmt.Printf("Erro ao buscar dispositivos conectados: %v\n", err)
+// 		return
+// 	}
 
-	for _, device := range devices {
-		// Tentar conectar em uma goroutine separada
-		go func(d database.WhatsAppDevice) {
-			err := m.ConnectClient(d.ID)
-			if err != nil {
-				fmt.Printf("Erro ao reconectar dispositivo %d: %v\n", d.ID, err)
-			}
-		}(device)
-	}
-}
+// 	for _, device := range devices {
+// 		// Tentar conectar em uma goroutine separada
+// 		go func(d database.WhatsAppDevice) {
+// 			err := m.ConnectClient(d.ID)
+// 			if err != nil {
+// 				fmt.Printf("Erro ao reconectar dispositivo %d: %v\n", d.ID, err)
+// 			}
+// 		}(device)
+// 	}
+// }
 
 func (m *Manager) ConfigureWebhook(config *WebhookConfig) {
 	m.mutex.Lock()
@@ -329,8 +720,8 @@ func (m *Manager) Connect() error {
 	go m.ConnectAllApproved()
 
 	// Reconectar dispositivos anteriormente conectados
-	fmt.Println("Tentando reconectar dispositivos previamente conectados")
-	go m.ReconnectAllConnected()
+	//fmt.Println("Tentando reconectar dispositivos previamente conectados")
+	//go m.ReconnectAllConnected()
 
 	return nil
 }

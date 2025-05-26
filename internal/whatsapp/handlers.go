@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -131,7 +133,6 @@ func (h *EventHandler) handleLoggedOut(deviceID int64) {
 
 // handleMessage processa uma mensagem recebida
 func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
-
 	// Obter cliente para poder baixar mídia
 	client, err := h.Manager.GetClient(deviceID)
 	if err != nil {
@@ -144,9 +145,8 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 	if err != nil || !tracked.IsTracked {
 		fmt.Printf("Não salvar mensagens não trackeadas para contato/grupo %s: %v\n", msg.Info.Chat.String(), err)
 		if msg.Info.IsGroup {
-			return // Não salvar mensagens não trackeadas e não continuar com o restante do loop //TODO verificar se isso vai ficar mesmo assim
+			return // Não salvar mensagens não trackeadas e não continuar com o restante do loop
 		}
-
 	}
 
 	// Registrar mensagem no banco de dados
@@ -162,36 +162,151 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 	}
 
 	mediaType := getMessageMediaType(msg)
+	var audioBase64 string // Para armazenar áudio convertido em base64
 
 	if mediaType != "text" && tracked.TrackMedia {
-		if !isAllowedMediaType(mediaType, tracked.AllowedMediaTypes) {
+		if !isAllowedMediaType(mediaType, tracked.AllowedMediaTypes) && mediaType != "audio" {
 			return
 		}
 
-		if url, content, err := h.downloadAndSaveMedia(deviceID, msg, client); err == nil {
-			message.MediaType = mediaType
-			message.MediaURL = url
-			if content != "" {
-				message.Content = content
+		if mediaType == "audio" {
+			// Processar áudio: download, conversão para MP3 e codificação em base64
+			mp3Base64, err := h.processAudioMessage(deviceID, msg, client)
+			if err != nil {
+				fmt.Printf("Erro ao processar áudio: %v\n", err)
+				// Continuar sem o áudio processado
+			} else {
+				audioBase64 = mp3Base64
+				fmt.Printf("Áudio processado com sucesso para mensagem %s\n", msg.Info.ID)
 			}
 		} else {
-			fmt.Printf("Erro ao baixar e salvar mídia: %v\n", err)
+			if url, content, err := h.downloadAndSaveMedia(deviceID, msg, client); err == nil {
+				message.MediaType = mediaType
+				message.MediaURL = url
+				if content != "" {
+					message.Content = content
+				}
+			} else {
+				fmt.Printf("Erro ao baixar e salvar mídia: %v\n", err)
+			}
 		}
 	}
 
-	if msg.Info.IsGroup { //TODO verificar se isso vai ficar mesmo assim
-		if err := h.DB.SaveMessage(message); err != nil {
-			fmt.Printf("Erro ao salvar mensagem: %v\n", err)
+	// Salvar mensagem no banco (exceto áudios que são processados diferentemente)
+	if mediaType != "audio" {
+		if msg.Info.IsGroup {
+			if err := h.DB.SaveMessage(message); err != nil {
+				fmt.Printf("Erro ao salvar mensagem: %v\n", err)
+			}
 		}
-	} else { //TODO verificar se isso vai ficar mesmo assim
-		fmt.Printf("Não salvar mensagem: %v\n", err)
+		// Notificar o Assistant API sobre o evento
+		go h.DB.NotifyAssistantAboutMessage(message)
+	} else {
+		// Notificar o Assistant API sobre o evento
+		// Para áudios, passar o base64 como parâmetro adicional
+		go h.DB.NotifyAssistantAboutMessageWithAudio(message, audioBase64)
 	}
-
-	// Após salvar a mensagem, notificar o Assistant API sobre o evento
-	// Este passo é assíncrono e não afeta o retorno da função
-	go h.DB.NotifyAssistantAboutMessage(message)
 
 	fmt.Printf("Dispositivo %d recebeu mensagem de %s: %s\n", deviceID, message.Sender, message.Content)
+}
+
+// processAudioMessage processa uma mensagem de áudio: download, conversão para MP3 e codificação em base64
+func (h *EventHandler) processAudioMessage(deviceID int64, msg *events.Message, client *Client) (string, error) {
+	// Baixar o arquivo de áudio
+	audio := msg.Message.GetAudioMessage()
+	if audio == nil {
+		return "", fmt.Errorf("mensagem de áudio não encontrada")
+	}
+
+	data, err := client.Client.Download(audio)
+	if err != nil {
+		return "", fmt.Errorf("erro ao baixar áudio: %w", err)
+	}
+
+	if len(data) == 0 {
+		return "", fmt.Errorf("nenhum dado de áudio recebido")
+	}
+
+	// Criar arquivo temporário para o áudio original
+	tempDir := "./temp"
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return "", fmt.Errorf("erro ao criar diretório temporário: %w", err)
+	}
+
+	// Arquivo de entrada (formato original do WhatsApp, geralmente OGG)
+	inputFile := filepath.Join(tempDir, fmt.Sprintf("audio_%d_%s.ogg", deviceID, msg.Info.ID))
+	if err := ioutil.WriteFile(inputFile, data, 0644); err != nil {
+		return "", fmt.Errorf("erro ao salvar arquivo de áudio temporário: %w", err)
+	}
+
+	// Limpar arquivo temporário no final
+	defer func() {
+		if err := os.Remove(inputFile); err != nil {
+			fmt.Printf("Aviso: erro ao remover arquivo temporário %s: %v\n", inputFile, err)
+		}
+	}()
+
+	// Arquivo de saída (MP3)
+	outputFile := filepath.Join(tempDir, fmt.Sprintf("audio_%d_%s.mp3", deviceID, msg.Info.ID))
+	defer func() {
+		if err := os.Remove(outputFile); err != nil {
+			fmt.Printf("Aviso: erro ao remover arquivo MP3 temporário %s: %v\n", outputFile, err)
+		}
+	}()
+
+	// Converter para MP3 usando ffmpeg
+	if err := h.convertToMP3(inputFile, outputFile); err != nil {
+		return "", fmt.Errorf("erro ao converter áudio para MP3: %w", err)
+	}
+
+	// Ler o arquivo MP3 convertido
+	mp3Data, err := ioutil.ReadFile(outputFile)
+	if err != nil {
+		return "", fmt.Errorf("erro ao ler arquivo MP3 convertido: %w", err)
+	}
+
+	// Codificar em base64
+	base64String := base64.StdEncoding.EncodeToString(mp3Data)
+
+	return base64String, nil
+}
+
+// convertToMP3 converte um arquivo de áudio para MP3 usando ffmpeg
+func (h *EventHandler) convertToMP3(inputFile, outputFile string) error {
+	// Verificar se ffmpeg está disponível
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return fmt.Errorf("ffmpeg não encontrado no sistema. Instale o ffmpeg para processar áudios: %w", err)
+	}
+
+	// Comando ffmpeg para conversão
+	// -i: arquivo de entrada
+	// -acodec libmp3lame: usar codec MP3
+	// -ab 128k: bitrate de 128kbps
+	// -ar 44100: sample rate de 44.1kHz
+	// -y: sobrescrever arquivo de saída se existir
+	cmd := exec.Command("ffmpeg",
+		"-i", inputFile,
+		"-acodec", "libmp3lame",
+		"-ab", "128k",
+		"-ar", "44100",
+		"-y",
+		outputFile)
+
+	// Capturar saída de erro para debug
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	// Executar comando
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("erro ao executar ffmpeg: %w, stderr: %s", err, stderr.String())
+	}
+
+	// Verificar se o arquivo de saída foi criado
+	if _, err := os.Stat(outputFile); os.IsNotExist(err) {
+		return fmt.Errorf("arquivo MP3 não foi criado")
+	}
+
+	return nil
 }
 
 // sendEventToAssistant envia um evento para o Assistant API

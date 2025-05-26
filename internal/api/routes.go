@@ -42,6 +42,14 @@ func SetupRoutes(router *gin.Engine, handler *Handler) {
 			devices.DELETE("/:id/tracked/:jid", handler.DeleteTrackedEntity)
 		}
 
+		// Rotas de monitoramento e administração
+		admin := api.Group("/admin")
+		{
+			admin.GET("/status", handler.GetSystemStatus)
+			admin.POST("/devices/:id/fix", handler.FixDeviceIssue)
+			admin.POST("/devices/:id/reconnect", handler.ReconnectDevice)
+		}
+
 		// // Webhook
 		// webhook := api.Group("/webhook")
 		// {
@@ -53,3 +61,25 @@ func SetupRoutes(router *gin.Engine, handler *Handler) {
 		// }
 	}
 }
+
+// Exemplo de uso das novas funcionalidades:
+
+/*
+# Ver status do sistema
+GET /api/admin/status
+
+# Limpar sessão corrompida do dispositivo 2
+POST /api/admin/devices/2/fix
+{
+  "action": "clear_session"
+}
+
+# Forçar reconexão do dispositivo 3
+POST /api/admin/devices/3/reconnect
+
+# Reset flag de reauth
+POST /api/admin/devices/2/fix
+{
+  "action": "reset_reauth"
+}
+*/
