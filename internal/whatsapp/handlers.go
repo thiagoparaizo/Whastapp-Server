@@ -140,29 +140,42 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 		return
 	}
 
-	// Verificar se o contato/grupo está sendo trackado
-	tracked, err := h.DB.GetTrackedEntity(deviceID, msg.Info.Chat.String())
+	// NOVO: Resolver LID para número real se necessário
+	resolvedSender := h.resolveLIDToPhoneNumber(client, msg.Info.Sender)
+	resolvedChat := h.resolveLIDToPhoneNumber(client, msg.Info.Chat)
+	
+	// Log para debug
+	if resolvedSender != msg.Info.Sender.String() {
+		fmt.Printf("LID resolvido: %s -> %s\n", msg.Info.Sender.String(), resolvedSender)
+	}
+	if resolvedChat != msg.Info.Chat.String() {
+		fmt.Printf("Chat LID resolvido: %s -> %s\n", msg.Info.Chat.String(), resolvedChat)
+	}
+
+	// Verificar se o contato/grupo está sendo trackado (usar IDs resolvidos)
+	tracked, err := h.DB.GetTrackedEntity(deviceID, resolvedChat)
 	if err != nil || !tracked.IsTracked {
-		fmt.Printf("Não salvar mensagens não trackeadas para contato/grupo %s: %v\n", msg.Info.Chat.String(), err)
+		fmt.Printf("Não salvar mensagens não trackeadas para contato/grupo %s: %v\n", resolvedChat, err)
 		if msg.Info.IsGroup {
-			return // Não salvar mensagens não trackeadas e não continuar com o restante do loop
+			return
 		}
 	}
 
-	// Registrar mensagem no banco de dados
+	// Registrar mensagem no banco de dados (usar IDs resolvidos)
 	message := &database.WhatsAppMessage{
 		DeviceID:  deviceID,
-		JID:       msg.Info.Chat.String(),
+		JID:       resolvedChat,        // Usar chat resolvido
 		MessageID: msg.Info.ID,
-		Sender:    msg.Info.Sender.String(),
+		Sender:    resolvedSender,      // Usar sender resolvido
 		IsFromMe:  msg.Info.IsFromMe,
 		IsGroup:   msg.Info.IsGroup,
 		Timestamp: msg.Info.Timestamp,
 		Content:   getMessageTextContent(msg),
 	}
 
+	// Resto do método permanece igual...
 	mediaType := getMessageMediaType(msg)
-	var audioBase64 string // Para armazenar áudio convertido em base64
+	var audioBase64 string
 
 	if mediaType != "text" && tracked.TrackMedia {
 		if !isAllowedMediaType(mediaType, tracked.AllowedMediaTypes) && mediaType != "audio" {
@@ -170,11 +183,9 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 		}
 
 		if mediaType == "audio" {
-			// Processar áudio: download, conversão para MP3 e codificação em base64
 			mp3Base64, err := h.processAudioMessage(deviceID, msg, client)
 			if err != nil {
 				fmt.Printf("Erro ao processar áudio: %v\n", err)
-				// Continuar sem o áudio processado
 			} else {
 				audioBase64 = mp3Base64
 				fmt.Printf("Áudio processado com sucesso para mensagem %s\n", msg.Info.ID)
@@ -192,22 +203,19 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 		}
 	}
 
-	// Salvar mensagem no banco (exceto áudios que são processados diferentemente)
+	// Salvar mensagem no banco (exceto áudios)
 	if mediaType != "audio" {
 		if msg.Info.IsGroup {
 			if err := h.DB.SaveMessage(message); err != nil {
 				fmt.Printf("Erro ao salvar mensagem: %v\n", err)
 			}
 		}
-		// Notificar o Assistant API sobre o evento
 		go h.DB.NotifyAssistantAboutMessage(message)
 	} else {
-		// Notificar o Assistant API sobre o evento
-		// Para áudios, passar o base64 como parâmetro adicional
 		go h.DB.NotifyAssistantAboutMessageWithAudio(message, audioBase64)
 	}
 
-	fmt.Printf("Dispositivo %d recebeu mensagem de %s: %s\n", deviceID, message.Sender, message.Content)
+	fmt.Printf("Dispositivo %d recebeu mensagem de %s: %s\n", deviceID, resolvedSender, message.Content)
 }
 
 // processAudioMessage processa uma mensagem de áudio: download, conversão para MP3 e codificação em base64
@@ -307,6 +315,63 @@ func (h *EventHandler) convertToMP3(inputFile, outputFile string) error {
 	}
 
 	return nil
+}
+
+// resolveLIDToPhoneNumber converte LID para número real quando possível
+func (h *EventHandler) resolveLIDToPhoneNumber(client *whatsmeow.Client, jid types.JID) string {
+	// Se não for LID, retornar como está
+	if jid.Server != types.HiddenUserServer {
+		return jid.String()
+	}
+
+	// É um LID - tentar resolver
+	realNumber := h.getLIDMapping(client, jid)
+	if realNumber != "" {
+		fmt.Printf("LID %s resolvido para %s\n", jid.String(), realNumber)
+		return realNumber
+	}
+
+	// Se não conseguir resolver, manter o LID original
+	fmt.Printf("Não foi possível resolver LID %s, mantendo original\n", jid.String())
+	return jid.String()
+}
+
+// getLIDMapping tenta encontrar o número real para um LID
+func (h *EventHandler) getLIDMapping(client *whatsmeow.Client, lid types.JID) string {
+	// Estratégia 1: Verificar se há SenderAlt ou RecipientAlt na mensagem atual
+	// (isso seria passado como parâmetro se necessário)
+
+	// Estratégia 2: Buscar nos contatos conhecidos
+	contacts, err := client.GetAllContacts()
+	if err != nil {
+		fmt.Printf("Erro ao obter contatos para resolução de LID: %v\n", err)
+		return ""
+	}
+
+	// Procurar correspondência pelo número do LID
+	lidNumber := lid.User
+	for jid, contact := range contacts {
+		if contact.Found && jid.Server == types.DefaultUserServer {
+			// Verificar se o número do contato corresponde ao LID
+			if jid.User == lidNumber {
+				return jid.String()
+			}
+		}
+	}
+
+	// Estratégia 3: Tentar formato padrão assumindo que o número é válido
+	if isValidPhoneNumber(lidNumber) {
+		return lidNumber + "@s.whatsapp.net"
+	}
+
+	return ""
+}
+
+// isValidPhoneNumber verifica se uma string parece ser um número de telefone válido
+func isValidPhoneNumber(number string) bool {
+	// Verificar se é apenas dígitos e tem tamanho razoável (8-15 dígitos)
+	matched, _ := regexp.MatchString(`^\d{8,15}$`, number)
+	return matched
 }
 
 // sendEventToAssistant envia um evento para o Assistant API
