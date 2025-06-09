@@ -26,7 +26,6 @@ import (
 
 	"sync"
 
-	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -50,6 +49,7 @@ type EventHandler struct {
 	lidMutex      sync.RWMutex
 }
 
+// cacheLIDMapping armazena mapeamento LID no cache
 func (h *EventHandler) cacheLIDMapping(lid, phoneNumber string) {
 	h.lidMutex.Lock()
 	defer h.lidMutex.Unlock()
@@ -58,11 +58,17 @@ func (h *EventHandler) cacheLIDMapping(lid, phoneNumber string) {
 		h.lidCache = make(map[string]string)
 	}
 	h.lidCache[lid] = phoneNumber
+	fmt.Printf("Cache LID: %s -> %s\n", lid, phoneNumber)
 }
 
+// getCachedLIDMapping recupera mapeamento do cache
 func (h *EventHandler) getCachedLIDMapping(lid string) (string, bool) {
 	h.lidMutex.RLock()
 	defer h.lidMutex.RUnlock()
+
+	if h.lidCache == nil {
+		return "", false
+	}
 
 	phoneNumber, exists := h.lidCache[lid]
 	return phoneNumber, exists
@@ -167,8 +173,8 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 		return
 	}
 
-	resolvedSender := h.resolveLIDToPhoneNumberSimple(msg.Info.Sender)
-	resolvedChat := h.resolveLIDToPhoneNumberSimple(msg.Info.Chat)
+	resolvedSender := h.resolveContactID(msg.Info.Sender, msg.Info.SenderAlt)
+	resolvedChat := h.resolveContactID(msg.Info.Chat, msg.Info.RecipientAlt)
 
 	// Log para debug
 	if resolvedSender != msg.Info.Sender.String() {
@@ -244,23 +250,31 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 	fmt.Printf("Dispositivo %d recebeu mensagem de %s: %s\n", deviceID, resolvedSender, message.Content)
 }
 
-func (h *EventHandler) resolveLIDToPhoneNumberSimple(jid types.JID) string {
-	// Se não for LID, retornar como está
-	if jid.Server != types.HiddenUserServer {
-		return jid.String()
+func (h *EventHandler) resolveContactID(primaryJID, altJID types.JID) string {
+	// Se o JID principal não é LID, usar ele mesmo
+	if primaryJID.Server != types.HiddenUserServer {
+		return primaryJID.String()
 	}
 
-	// Para LID, tentar converter para formato padrão
-	lidNumber := jid.User
-	if h.isValidPhoneNumber(lidNumber) {
-		resolved := lidNumber + "@s.whatsapp.net"
-		fmt.Printf("LID %s convertido para %s\n", jid.String(), resolved)
-		return resolved
+	// É um LID - verificar se temos o Alt (número real)
+	if altJID.Server == types.DefaultUserServer && altJID.User != "" {
+		fmt.Printf("LID %s resolvido via Alt para %s\n", primaryJID.String(), altJID.String())
+
+		// Salvar mapeamento para futuro uso
+		h.cacheLIDMapping(primaryJID.String(), altJID.String())
+
+		return altJID.String()
+	}
+
+	// Verificar cache de mapeamentos conhecidos
+	if cached, exists := h.getCachedLIDMapping(primaryJID.String()); exists {
+		fmt.Printf("LID %s resolvido via cache para %s\n", primaryJID.String(), cached)
+		return cached
 	}
 
 	// Se não conseguir resolver, manter o LID original
-	fmt.Printf("Mantendo LID original: %s\n", jid.String())
-	return jid.String()
+	fmt.Printf("LID %s não pode ser resolvido, mantendo original\n", primaryJID.String())
+	return primaryJID.String()
 }
 
 // isValidPhoneNumber verifica se uma string parece ser um número de telefone válido
@@ -368,84 +382,6 @@ func (h *EventHandler) convertToMP3(inputFile, outputFile string) error {
 
 	return nil
 }
-
-// resolveLIDToPhoneNumber converte LID para número real quando possível
-func (h *EventHandler) resolveLIDToPhoneNumber(client *whatsmeow.Client, jid types.JID) string {
-	// Se não for LID, retornar como está
-	if jid.Server != types.HiddenUserServer {
-		return jid.String()
-	}
-
-	// É um LID - tentar resolver
-	realNumber := h.getLIDMapping(client, jid)
-	if realNumber != "" {
-		fmt.Printf("LID %s resolvido para %s\n", jid.String(), realNumber)
-		return realNumber
-	}
-
-	// Se não conseguir resolver, manter o LID original
-	fmt.Printf("Não foi possível resolver LID %s, mantendo original\n", jid.String())
-	return jid.String()
-}
-
-// getLIDMapping tenta encontrar o número real para um LID
-func (h *EventHandler) getLIDMapping(client *whatsmeow.Client, lid types.JID) string {
-	// CORREÇÃO: Usar Store.Contacts para obter contatos
-	contacts, err := client.Store.Contacts.GetAllContacts()
-	if err != nil {
-		fmt.Printf("Erro ao obter contatos para resolução de LID: %v\n", err)
-		return ""
-	}
-
-	// Procurar correspondência pelo número do LID
-	lidNumber := lid.User
-	for jid, contact := range contacts {
-		if contact.Found && jid.Server == types.DefaultUserServer {
-			// Verificar se o número do contato corresponde ao LID
-			if jid.User == lidNumber {
-				return jid.String()
-			}
-		}
-	}
-
-	// Estratégia: Tentar formato padrão assumindo que o número é válido
-	if h.isValidPhoneNumber(lidNumber) {
-		return lidNumber + "@s.whatsapp.net"
-	}
-
-	return ""
-}
-
-// isValidPhoneNumber verifica se uma string parece ser um número de telefone válido
-func isValidPhoneNumber(number string) bool {
-	// Verificar se é apenas dígitos e tem tamanho razoável (8-15 dígitos)
-	matched, _ := regexp.MatchString(`^\d{8,15}$`, number)
-	return matched
-}
-
-// sendEventToAssistant envia um evento para o Assistant API
-// func (h *EventHandler) sendEventToAssistant(deviceID int64, evt interface{}) {
-// 	device, err := h.DB.GetDeviceByID(deviceID)
-// 	if err != nil || device == nil {
-// 		fmt.Printf("Erro ao buscar dispositivo para envio de evento ao Assistant: %d: %v\n", deviceID, err)
-// 		return
-// 	}
-
-// 	// Preparar dados do evento
-// 	event := map[string]interface{}{
-// 		"device_id":  deviceID,
-// 		"tenant_id":  device.TenantID,
-// 		"event_type": fmt.Sprintf("%T", evt),
-// 		"timestamp":  time.Now().Format(time.RFC3339),
-// 		"event":      evt,
-// 	}
-
-// 	// Enviar o evento para o Assistant API
-// 	err = h.DB.AssistantClient.SendWebhookEvent(event)
-// 	if err != nil {
-// 		fmt.Printf("Erro ao enviar evento para o Assistant API: %v\n", err)
-// 	}
-// }
 
 func getMessageTextContent(msg *events.Message) string {
 	if msg.Message.GetConversation() != "" {
