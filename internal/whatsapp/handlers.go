@@ -21,6 +21,13 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 
 	"whatsapp-service/internal/database"
+
+	"regexp"
+
+	"sync"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // WebhookConfig contém a configuração para enviar eventos para um webhook
@@ -39,6 +46,26 @@ type EventHandler struct {
 	WebhookConfig *WebhookConfig
 	httpClient    *http.Client
 	Manager       *Manager
+	lidCache      map[string]string // Cache LID -> PhoneNumber
+	lidMutex      sync.RWMutex
+}
+
+func (h *EventHandler) cacheLIDMapping(lid, phoneNumber string) {
+	h.lidMutex.Lock()
+	defer h.lidMutex.Unlock()
+
+	if h.lidCache == nil {
+		h.lidCache = make(map[string]string)
+	}
+	h.lidCache[lid] = phoneNumber
+}
+
+func (h *EventHandler) getCachedLIDMapping(lid string) (string, bool) {
+	h.lidMutex.RLock()
+	defer h.lidMutex.RUnlock()
+
+	phoneNumber, exists := h.lidCache[lid]
+	return phoneNumber, exists
 }
 
 // NewEventHandler cria um novo manipulador de eventos
@@ -140,10 +167,9 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 		return
 	}
 
-	// NOVO: Resolver LID para número real se necessário
-	resolvedSender := h.resolveLIDToPhoneNumber(client, msg.Info.Sender)
-	resolvedChat := h.resolveLIDToPhoneNumber(client, msg.Info.Chat)
-	
+	resolvedSender := h.resolveLIDToPhoneNumberSimple(msg.Info.Sender)
+	resolvedChat := h.resolveLIDToPhoneNumberSimple(msg.Info.Chat)
+
 	// Log para debug
 	if resolvedSender != msg.Info.Sender.String() {
 		fmt.Printf("LID resolvido: %s -> %s\n", msg.Info.Sender.String(), resolvedSender)
@@ -164,9 +190,9 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 	// Registrar mensagem no banco de dados (usar IDs resolvidos)
 	message := &database.WhatsAppMessage{
 		DeviceID:  deviceID,
-		JID:       resolvedChat,        // Usar chat resolvido
+		JID:       resolvedChat, // Usar chat resolvido
 		MessageID: msg.Info.ID,
-		Sender:    resolvedSender,      // Usar sender resolvido
+		Sender:    resolvedSender, // Usar sender resolvido
 		IsFromMe:  msg.Info.IsFromMe,
 		IsGroup:   msg.Info.IsGroup,
 		Timestamp: msg.Info.Timestamp,
@@ -216,6 +242,32 @@ func (h *EventHandler) handleMessage(deviceID int64, msg *events.Message) {
 	}
 
 	fmt.Printf("Dispositivo %d recebeu mensagem de %s: %s\n", deviceID, resolvedSender, message.Content)
+}
+
+func (h *EventHandler) resolveLIDToPhoneNumberSimple(jid types.JID) string {
+	// Se não for LID, retornar como está
+	if jid.Server != types.HiddenUserServer {
+		return jid.String()
+	}
+
+	// Para LID, tentar converter para formato padrão
+	lidNumber := jid.User
+	if h.isValidPhoneNumber(lidNumber) {
+		resolved := lidNumber + "@s.whatsapp.net"
+		fmt.Printf("LID %s convertido para %s\n", jid.String(), resolved)
+		return resolved
+	}
+
+	// Se não conseguir resolver, manter o LID original
+	fmt.Printf("Mantendo LID original: %s\n", jid.String())
+	return jid.String()
+}
+
+// isValidPhoneNumber verifica se uma string parece ser um número de telefone válido
+func (h *EventHandler) isValidPhoneNumber(number string) bool {
+	// Verificar se é apenas dígitos e tem tamanho razoável (8-15 dígitos)
+	matched, _ := regexp.MatchString(`^\d{8,15}$`, number)
+	return matched
 }
 
 // processAudioMessage processa uma mensagem de áudio: download, conversão para MP3 e codificação em base64
@@ -338,11 +390,8 @@ func (h *EventHandler) resolveLIDToPhoneNumber(client *whatsmeow.Client, jid typ
 
 // getLIDMapping tenta encontrar o número real para um LID
 func (h *EventHandler) getLIDMapping(client *whatsmeow.Client, lid types.JID) string {
-	// Estratégia 1: Verificar se há SenderAlt ou RecipientAlt na mensagem atual
-	// (isso seria passado como parâmetro se necessário)
-
-	// Estratégia 2: Buscar nos contatos conhecidos
-	contacts, err := client.GetAllContacts()
+	// CORREÇÃO: Usar Store.Contacts para obter contatos
+	contacts, err := client.Store.Contacts.GetAllContacts()
 	if err != nil {
 		fmt.Printf("Erro ao obter contatos para resolução de LID: %v\n", err)
 		return ""
@@ -359,8 +408,8 @@ func (h *EventHandler) getLIDMapping(client *whatsmeow.Client, lid types.JID) st
 		}
 	}
 
-	// Estratégia 3: Tentar formato padrão assumindo que o número é válido
-	if isValidPhoneNumber(lidNumber) {
+	// Estratégia: Tentar formato padrão assumindo que o número é válido
+	if h.isValidPhoneNumber(lidNumber) {
 		return lidNumber + "@s.whatsapp.net"
 	}
 
