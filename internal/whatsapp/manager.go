@@ -69,8 +69,11 @@ func NewManager(dbString string, postgresDB *database.DB) (*Manager, error) {
 	// Inicializar logger
 	logger := waLog.Stdout("WhatsApp", "INFO", true)
 
+	// Criar context para inicialização
+	ctx := context.Background()
+
 	// Inicializar container de dispositivos do whatsmeow
-	container, err := sqlstore.New("postgres", dbString, logger)
+	container, err := sqlstore.New(ctx, "postgres", dbString, logger)
 	if err != nil {
 		return nil, fmt.Errorf("falha ao criar container: %w", err)
 	}
@@ -132,8 +135,11 @@ func (m *Manager) GetClient(deviceID int64) (*Client, error) {
 			fmt.Printf("JID inválido para dispositivo %d: %v\n", deviceID, err)
 			needsReauth = true
 		} else {
-			// Tentar obter sessão existente
-			deviceStore, err = m.container.GetDevice(wajid)
+			// Tentar obter sessão existente com context
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			deviceStore, err = m.container.GetDevice(ctx, wajid)
 			if err != nil || deviceStore == nil {
 				fmt.Printf("Sessão não encontrada para dispositivo %d (JID: %s)\n", deviceID, device.JID.String)
 				needsReauth = true
@@ -451,6 +457,8 @@ func (m *Manager) isCriticalConnectionError(err error) bool {
 func (m *Manager) CleanCorruptedSessions() error {
 	fmt.Println("Verificando sessões para limpeza...")
 
+	ctx := context.Background() // Context para operações de banco/whatsmeow
+
 	// CORREÇÃO: Buscar apenas dispositivos com problemas reais
 	// NÃO limpar dispositivos conectados que só têm requires_reauth=true
 	devices, err := m.db.Query(`
@@ -490,7 +498,7 @@ func (m *Manager) CleanCorruptedSessions() error {
 				needsCleaning = true
 			} else {
 				// Tentar obter sessão
-				deviceStore, err := m.container.GetDevice(wajid)
+				deviceStore, err := m.container.GetDevice(ctx, wajid)
 				if err != nil || deviceStore == nil {
 					fmt.Printf("Sessão não encontrada no whatsmeow para dispositivo %d\n", deviceID)
 					needsCleaning = true

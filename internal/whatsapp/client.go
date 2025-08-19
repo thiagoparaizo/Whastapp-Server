@@ -278,7 +278,11 @@ func (c *Client) GetContacts() (map[types.JID]types.ContactInfo, error) {
 		return nil, fmt.Errorf("cliente não está conectado")
 	}
 
-	return c.Client.Store.Contacts.GetAllContacts()
+	// Adicionar context com timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	return c.Client.Store.Contacts.GetAllContacts(ctx)
 }
 
 // GetGroupMessages obtém mensagens de um grupo específico

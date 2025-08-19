@@ -292,7 +292,11 @@ func (h *EventHandler) processAudioMessage(deviceID int64, msg *events.Message, 
 		return "", fmt.Errorf("mensagem de áudio não encontrada")
 	}
 
-	data, err := client.Client.Download(audio)
+	// Adicionar context com timeout para download
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	data, err := client.Client.Download(ctx, audio)
 	if err != nil {
 		return "", fmt.Errorf("erro ao baixar áudio: %w", err)
 	}
@@ -431,7 +435,12 @@ func (h *EventHandler) downloadAndSaveMedia(deviceID int64, msg *events.Message,
 	case msg.Message.GetImageMessage() != nil:
 		img := msg.Message.GetImageMessage()
 		content = img.GetCaption()
-		data, err = client.Client.Download(img)
+
+		// Criar context com timeout apropriado para imagem
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, img)
 		if err != nil {
 			return "", "", fmt.Errorf("erro ao baixar imagem: %w", err)
 		}
@@ -440,7 +449,12 @@ func (h *EventHandler) downloadAndSaveMedia(deviceID int64, msg *events.Message,
 	case msg.Message.GetVideoMessage() != nil:
 		vid := msg.Message.GetVideoMessage()
 		content = vid.GetCaption()
-		data, err = client.Client.Download(vid)
+
+		// Timeout maior para vídeos (podem ser maiores)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, vid)
 		if err != nil {
 			return "", "", fmt.Errorf("erro ao baixar vídeo: %w", err)
 		}
@@ -448,7 +462,12 @@ func (h *EventHandler) downloadAndSaveMedia(deviceID int64, msg *events.Message,
 
 	case msg.Message.GetAudioMessage() != nil:
 		audio := msg.Message.GetAudioMessage()
-		data, err = client.Client.Download(audio)
+
+		// Timeout médio para áudios
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, audio)
 		if err != nil {
 			return "", "", fmt.Errorf("erro ao baixar áudio: %w", err)
 		}
@@ -457,7 +476,12 @@ func (h *EventHandler) downloadAndSaveMedia(deviceID int64, msg *events.Message,
 	case msg.Message.GetDocumentMessage() != nil:
 		doc := msg.Message.GetDocumentMessage()
 		content = doc.GetTitle()
-		data, err = client.Client.Download(doc)
+
+		// Timeout maior para documentos (podem variar muito em tamanho)
+		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, doc)
 		if err != nil {
 			return "", "", fmt.Errorf("erro ao baixar documento: %w", err)
 		}
@@ -465,6 +489,132 @@ func (h *EventHandler) downloadAndSaveMedia(deviceID int64, msg *events.Message,
 		originalFilename = doc.GetFileName()
 		if originalFilename == "" {
 			originalFilename = fmt.Sprintf("%s.%s", msg.Info.ID, getExtensionFromMime(doc.GetMimetype()))
+		}
+
+	case msg.Message.GetStickerMessage() != nil:
+		// Adicionar suporte para stickers se necessário
+		sticker := msg.Message.GetStickerMessage()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, sticker)
+		if err != nil {
+			return "", "", fmt.Errorf("erro ao baixar sticker: %w", err)
+		}
+		mediaType = "sticker"
+		originalFilename = fmt.Sprintf("%s.webp", msg.Info.ID)
+
+	default:
+		return "", "", fmt.Errorf("nenhuma mídia detectada")
+	}
+
+	if len(data) == 0 {
+		return "", "", fmt.Errorf("nenhum dado recebido")
+	}
+
+	// Chamar nossa nova função de armazenamento
+	mediaURL, err := h.storeMedia(deviceID, msg.Info.ID, mediaType, data, originalFilename)
+	if err != nil {
+		return "", "", fmt.Errorf("erro ao armazenar mídia: %w", err)
+	}
+
+	return mediaURL, content, nil
+}
+
+// Função auxiliar para timeout dinâmico baseado no tamanho esperado
+func (h *EventHandler) downloadAndSaveMediaWithDynamicTimeout(deviceID int64, msg *events.Message, client *Client) (string, string, error) {
+	var data []byte
+	var mediaType string
+	var content string
+	var originalFilename string
+	var err error
+	var timeout time.Duration
+
+	switch {
+	case msg.Message.GetImageMessage() != nil:
+		img := msg.Message.GetImageMessage()
+		content = img.GetCaption()
+		mediaType = "image"
+
+		// Calcular timeout baseado no tamanho do arquivo (se disponível)
+		fileSize := img.GetFileLength()
+		timeout = calculateTimeout(fileSize, 60*time.Second) // mínimo 60s para imagens
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, img)
+		if err != nil {
+			return "", "", fmt.Errorf("erro ao baixar imagem: %w", err)
+		}
+
+	case msg.Message.GetVideoMessage() != nil:
+		vid := msg.Message.GetVideoMessage()
+		content = vid.GetCaption()
+		mediaType = "video"
+
+		fileSize := vid.GetFileLength()
+		timeout = calculateTimeout(fileSize, 120*time.Second) // mínimo 120s para vídeos
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, vid)
+		if err != nil {
+			return "", "", fmt.Errorf("erro ao baixar vídeo: %w", err)
+		}
+
+	case msg.Message.GetAudioMessage() != nil:
+		audio := msg.Message.GetAudioMessage()
+		mediaType = "audio"
+
+		fileSize := audio.GetFileLength()
+		timeout = calculateTimeout(fileSize, 90*time.Second) // mínimo 90s para áudios
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, audio)
+		if err != nil {
+			return "", "", fmt.Errorf("erro ao baixar áudio: %w", err)
+		}
+
+	case msg.Message.GetDocumentMessage() != nil:
+		doc := msg.Message.GetDocumentMessage()
+		content = doc.GetTitle()
+		mediaType = "document"
+		originalFilename = doc.GetFileName()
+
+		fileSize := doc.GetFileLength()
+		timeout = calculateTimeout(fileSize, 180*time.Second) // mínimo 180s para documentos
+
+		if originalFilename == "" {
+			originalFilename = fmt.Sprintf("%s.%s", msg.Info.ID, getExtensionFromMime(doc.GetMimetype()))
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, doc)
+		if err != nil {
+			return "", "", fmt.Errorf("erro ao baixar documento: %w", err)
+		}
+
+	case msg.Message.GetStickerMessage() != nil:
+		sticker := msg.Message.GetStickerMessage()
+		mediaType = "sticker"
+		originalFilename = fmt.Sprintf("%s.webp", msg.Info.ID)
+
+		fileSize := sticker.GetFileLength()
+		timeout = calculateTimeout(fileSize, 60*time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		data, err = client.Client.Download(ctx, sticker)
+		if err != nil {
+			return "", "", fmt.Errorf("erro ao baixar sticker: %w", err)
 		}
 
 	default:
@@ -482,6 +632,69 @@ func (h *EventHandler) downloadAndSaveMedia(deviceID int64, msg *events.Message,
 	}
 
 	return mediaURL, content, nil
+}
+
+// Função auxiliar para calcular timeout baseado no tamanho do arquivo
+func calculateTimeout(fileSize uint64, minTimeout time.Duration) time.Duration {
+	if fileSize == 0 {
+		return minTimeout
+	}
+
+	// Calcular timeout baseado em uma velocidade estimada de download
+	// Assumindo ~1MB/s como velocidade mínima
+	estimatedSeconds := int64(fileSize / (1024 * 1024)) // fileSize em MB
+	if estimatedSeconds < int64(minTimeout.Seconds()) {
+		return minTimeout
+	}
+
+	// Adicionar uma margem de segurança (50% extra)
+	return time.Duration(estimatedSeconds) * time.Second * 3 / 2
+}
+
+// Função auxiliar para obter extensão do MIME type (se você não tiver)
+func getExtensionFromMime(mimetype string) string {
+	switch mimetype {
+	case "image/jpeg":
+		return "jpg"
+	case "image/png":
+		return "png"
+	case "image/gif":
+		return "gif"
+	case "image/webp":
+		return "webp"
+	case "video/mp4":
+		return "mp4"
+	case "video/avi":
+		return "avi"
+	case "video/mov":
+		return "mov"
+	case "audio/mpeg":
+		return "mp3"
+	case "audio/ogg":
+		return "ogg"
+	case "audio/wav":
+		return "wav"
+	case "audio/aac":
+		return "aac"
+	case "application/pdf":
+		return "pdf"
+	case "application/msword":
+		return "doc"
+	case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+		return "docx"
+	case "application/vnd.ms-excel":
+		return "xls"
+	case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+		return "xlsx"
+	case "text/plain":
+		return "txt"
+	case "application/zip":
+		return "zip"
+	case "application/x-rar-compressed":
+		return "rar"
+	default:
+		return "bin" // extensão genérica para arquivos desconhecidos
+	}
 }
 
 // Função que decide como armazenar o arquivo de mídia
@@ -597,27 +810,27 @@ func getExtensionFromMediaType(mediaType string) string {
 	}
 }
 
-// Função auxiliar para obter extensão de arquivo a partir do tipo MIME
-func getExtensionFromMime(mimeType string) string {
-	switch mimeType {
-	case "image/jpeg":
-		return "jpg"
-	case "image/png":
-		return "png"
-	case "image/gif":
-		return "gif"
-	case "video/mp4":
-		return "mp4"
-	case "audio/ogg":
-		return "ogg"
-	case "audio/mpeg":
-		return "mp3"
-	case "application/pdf":
-		return "pdf"
-	default:
-		return "bin"
-	}
-}
+// // Função auxiliar para obter extensão de arquivo a partir do tipo MIME
+// func getExtensionFromMime(mimeType string) string {
+// 	switch mimeType {
+// 	case "image/jpeg":
+// 		return "jpg"
+// 	case "image/png":
+// 		return "png"
+// 	case "image/gif":
+// 		return "gif"
+// 	case "video/mp4":
+// 		return "mp4"
+// 	case "audio/ogg":
+// 		return "ogg"
+// 	case "audio/mpeg":
+// 		return "mp3"
+// 	case "application/pdf":
+// 		return "pdf"
+// 	default:
+// 		return "bin"
+// 	}
+// }
 
 // sendToWebhook envia um evento para o webhook configurado
 func (h *EventHandler) sendToWebhook(deviceID int64, evt interface{}) {
