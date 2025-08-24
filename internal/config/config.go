@@ -2,9 +2,11 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -19,6 +21,16 @@ type Config struct {
 	BasicAuthUsername string
 	BasicAuthPassword string
 	AssistantAPIURL   string
+
+	// Configurações de notificação
+	NotificationWebhookURL string
+	SMTPHost               string
+	SMTPPort               int
+	SMTPUser               string
+	SMTPPassword           string
+	NotificationFromEmail  string
+	NotificationToEmails   []string
+	NotificationsEnabled   bool
 }
 
 // Load carrega configurações do ambiente
@@ -30,6 +42,15 @@ func Load() Config {
 
 	log.Print("Carregando configurações...")
 
+	// Parse emails (separados por vírgula)
+	toEmails := []string{}
+	if emailsStr := getEnv("NOTIFICATION_TO_EMAILS", ""); emailsStr != "" {
+		toEmails = strings.Split(emailsStr, ",")
+		for i, email := range toEmails {
+			toEmails[i] = strings.TrimSpace(email)
+		}
+	}
+
 	return Config{
 		Host:              getEnv("HOST", "0.0.0.0"),
 		Port:              getEnv("PORT", "8080"),
@@ -39,6 +60,16 @@ func Load() Config {
 		BasicAuthUsername: getEnv("BASIC_AUTH_USERNAME", ""),
 		BasicAuthPassword: getEnv("BASIC_AUTH_PASSWORD", ""),
 		AssistantAPIURL:   getEnv("ASSISTANT_API_URL", "http://localhost:8000/api/v1"),
+
+		// Notificações
+		NotificationWebhookURL: getEnv("NOTIFICATION_WEBHOOK_URL", ""),
+		SMTPHost:               getEnv("SMTP_HOST", ""),
+		SMTPPort:               getEnvInt("SMTP_PORT", 587),
+		SMTPUser:               getEnv("SMTP_USER", ""),
+		SMTPPassword:           getEnv("SMTP_PASSWORD", ""),
+		NotificationFromEmail:  getEnv("NOTIFICATION_FROM_EMAIL", ""),
+		NotificationToEmails:   toEmails,
+		NotificationsEnabled:   getEnvBool("NOTIFICATIONS_ENABLED", true),
 	}
 }
 
@@ -64,4 +95,43 @@ func getEnvBool(key string, defaultValue bool) bool {
 	}
 
 	return boolValue
+}
+
+// função getEnvInt:
+func getEnvInt(key string, defaultValue int) int {
+	strValue := os.Getenv(key)
+	if strValue == "" {
+		return defaultValue
+	}
+
+	intValue, err := strconv.Atoi(strValue)
+	if err != nil {
+		return defaultValue
+	}
+
+	return intValue
+}
+
+func (c *Config) ValidateEmailConfig() error {
+	if !c.NotificationsEnabled {
+		return nil // Email não é obrigatório se notificações estão desabilitadas
+	}
+
+	if c.SMTPHost == "" {
+		return fmt.Errorf("SMTP_HOST é obrigatório quando notificações estão habilitadas")
+	}
+
+	if c.SMTPUser == "" {
+		return fmt.Errorf("SMTP_USER é obrigatório")
+	}
+
+	if c.SMTPPassword == "" {
+		return fmt.Errorf("SMTP_PASSWORD é obrigatório")
+	}
+
+	if len(c.NotificationToEmails) == 0 {
+		return fmt.Errorf("NOTIFICATION_TO_EMAILS é obrigatório (pelo menos um email)")
+	}
+
+	return nil
 }

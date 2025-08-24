@@ -1017,3 +1017,107 @@ func (db *DB) GetConnectedDevicesWithoutClients(activeClientIDs []int64) ([]What
 	err := db.Select(&devices, query, args...)
 	return devices, err
 }
+
+// ==============================================
+// MÉTODOS PARA GERENCIAR NOTIFICATION_LOGS
+// ==============================================
+
+// SaveNotificationLog salva um log de notificação no banco
+func (db *DB) SaveNotificationLog(log *NotificationLog) error {
+	query := `
+		INSERT INTO notification_logs (
+			device_id, tenant_id, level, type, title, message, 
+			error_code, details, suggested_action, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		RETURNING id
+	`
+
+	err := db.QueryRow(query,
+		log.DeviceID,
+		log.TenantID,
+		log.Level,
+		log.Type,
+		log.Title,
+		log.Message,
+		log.ErrorCode,
+		log.Details,
+		log.SuggestedAction,
+		log.CreatedAt,
+	).Scan(&log.ID)
+
+	return err
+}
+
+// GetNotificationLogs busca logs de notificação com filtros
+func (db *DB) GetNotificationLogs(
+	deviceID *int64,
+	tenantID *int64,
+	level string,
+	notificationType string,
+	limit int,
+) ([]NotificationLog, error) {
+
+	var conditions []string
+	var args []interface{}
+	argIndex := 1
+
+	// Construir query dinamicamente com filtros
+	baseQuery := "SELECT id, device_id, tenant_id, level, type, title, message, error_code, details, suggested_action, created_at FROM notification_logs"
+
+	if deviceID != nil {
+		conditions = append(conditions, fmt.Sprintf("device_id = $%d", argIndex))
+		args = append(args, *deviceID)
+		argIndex++
+	}
+
+	if tenantID != nil {
+		conditions = append(conditions, fmt.Sprintf("tenant_id = $%d", argIndex))
+		args = append(args, *tenantID)
+		argIndex++
+	}
+
+	if level != "" {
+		conditions = append(conditions, fmt.Sprintf("level = $%d", argIndex))
+		args = append(args, level)
+		argIndex++
+	}
+
+	if notificationType != "" {
+		conditions = append(conditions, fmt.Sprintf("type = $%d", argIndex))
+		args = append(args, notificationType)
+		argIndex++
+	}
+
+	// Construir query final
+	query := baseQuery
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY created_at DESC"
+
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d", argIndex)
+		args = append(args, limit)
+	}
+
+	// Executar query
+	var logs []NotificationLog
+	err := db.Select(&logs, query, args...)
+	return logs, err
+}
+
+// CleanupOldNotificationLogs remove logs antigos (para manutenção)
+func (db *DB) CleanupOldNotificationLogs(daysToKeep int) (int64, error) {
+	query := `
+		DELETE FROM notification_logs 
+		WHERE created_at < NOW() - INTERVAL '%d days'
+	`
+
+	result, err := db.Exec(fmt.Sprintf(query, daysToKeep))
+	if err != nil {
+		return 0, err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	return rowsAffected, err
+}

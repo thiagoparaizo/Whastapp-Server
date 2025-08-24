@@ -29,10 +29,11 @@ type Client struct {
 	mutex         sync.Mutex
 	qrChannel     chan string
 	connected     bool
+	manager       *Manager
 }
 
 // NewClient cria um novo cliente WhatsApp
-func NewClient(deviceID int64, tenantID int64, deviceStore *store.Device, db *database.DB, logger waLog.Logger) *Client {
+func NewClient(deviceID int64, tenantID int64, deviceStore *store.Device, db *database.DB, logger waLog.Logger, manager *Manager) *Client {
 	//TODO func NewClient(deviceID int64, tenantID int64, deviceStore *store.Device, db *database.DB, logger waLog.Logger, deviceName string) *Client {
 
 	waClient := whatsmeow.NewClient(deviceStore, logger)
@@ -47,6 +48,7 @@ func NewClient(deviceID int64, tenantID int64, deviceStore *store.Device, db *da
 		TenantID:      tenantID,
 		DB:            db,
 		EventHandlers: make([]func(evt interface{}), 0),
+		manager:       manager,
 	}
 
 	// Adicionar handler de eventos padrão
@@ -217,6 +219,18 @@ func (c *Client) handleDisconnected() {
 	c.mutex.Lock()
 	c.connected = false
 	c.mutex.Unlock()
+
+	// IMPLEMENTAÇÃO DA NOTIFICAÇÃO
+	go func() {
+		if c.manager != nil && c.manager.notificationService != nil {
+			device, err := c.DB.GetDeviceByID(c.DeviceID)
+			if err == nil && device != nil {
+				c.manager.notificationService.NotifyDeviceDisconnected(c.DeviceID, device.Name, device.TenantID, "connection_lost")
+			} else {
+				fmt.Printf("Erro ao buscar dispositivo para notificação de desconexão: %v\n", err)
+			}
+		}
+	}()
 }
 
 // handleQR lida com o evento de código QR
@@ -247,6 +261,16 @@ func (c *Client) handleLoggedOut() {
 		err = c.DB.UpdateDeviceStatus(c.DeviceID, database.DeviceStatusApproved)
 		if err != nil {
 			fmt.Printf("Erro ao atualizar status do dispositivo: %v\n", err)
+		}
+
+		// IMPLEMENTAÇÃO DA NOTIFICAÇÃO
+		if c.manager != nil && c.manager.notificationService != nil {
+			device, err := c.DB.GetDeviceByID(c.DeviceID)
+			if err == nil && device != nil {
+				c.manager.notificationService.NotifyDeviceRequiresReauth(c.DeviceID, device.Name, device.TenantID)
+			} else {
+				fmt.Printf("Erro ao buscar dispositivo para notificação: %v\n", err)
+			}
 		}
 	}()
 

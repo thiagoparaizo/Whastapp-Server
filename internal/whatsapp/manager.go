@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -15,17 +16,32 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"whatsapp-service/internal/database"
+	"whatsapp-service/internal/notification"
 )
 
 // Manager gerencia múltiplos clientes WhatsApp
 type Manager struct {
-	clients       map[int64]*Client // Mapeado por deviceID
-	container     *sqlstore.Container
-	db            *database.DB
-	logger        waLog.Logger
-	mutex         sync.Mutex
-	eventHandlers []func(deviceID int64, evt interface{})
-	eventHandler  *EventHandler
+	clients             map[int64]*Client // Mapeado por deviceID
+	container           *sqlstore.Container
+	db                  *database.DB
+	logger              waLog.Logger
+	mutex               sync.Mutex
+	eventHandlers       []func(deviceID int64, evt interface{})
+	eventHandler        *EventHandler
+	notificationService *notification.NotificationService
+}
+
+// método para configurar notificações:
+func (m *Manager) SetNotificationService(ns *notification.NotificationService) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.notificationService = ns
+
+	// Também configurar no eventHandler se já existir
+	if m.eventHandler != nil {
+		// EventHandler já tem referência ao manager, então não precisa fazer nada extra
+		fmt.Println("Notification service configurado no manager e disponível para EventHandler")
+	}
 }
 
 // GetDetailedStatus retorna status detalhado do manager
@@ -167,7 +183,7 @@ func (m *Manager) GetClient(deviceID int64) (*Client, error) {
 	}
 
 	// Criar cliente
-	client := NewClient(deviceID, device.TenantID, deviceStore, m.db, m.logger) //TODOadd , device.deviceName string
+	client := NewClient(deviceID, device.TenantID, deviceStore, m.db, m.logger, m) // Último parâmetro é o manager //TODO add , device.deviceName string
 
 	// Adicionar handler global de eventos
 	client.AddEventHandler(func(evt interface{}) {
@@ -175,6 +191,15 @@ func (m *Manager) GetClient(deviceID int64) (*Client, error) {
 			handler(deviceID, evt)
 		}
 	})
+
+	// Adicionar handler de eventos do manager ao cliente
+	if m.eventHandler != nil {
+		client.EventHandlers = append(client.EventHandlers, func(evt interface{}) {
+			for _, handler := range m.eventHandlers {
+				handler(deviceID, evt)
+			}
+		})
+	}
 
 	// Armazenar cliente
 	m.clients[deviceID] = client
@@ -362,42 +387,70 @@ func (m *Manager) ConnectClientSafely(deviceID int64) error {
 	// Usar GetClient que já tem toda a lógica necessária
 	client, err := m.GetClient(deviceID)
 	if err != nil {
+		// NOTIFICAÇÃO 1: Erro ao obter/criar cliente
+		if m.notificationService != nil {
+			device, dbErr := m.db.GetDeviceByID(deviceID)
+			if dbErr == nil && device != nil {
+				m.notificationService.NotifyDeviceConnectionError(deviceID, device.Name, device.TenantID, err)
+			}
+		}
 		return fmt.Errorf("erro ao obter/criar cliente: %w", err)
 	}
 
 	// Tentar conectar com timeout
 	connectChan := make(chan error, 1)
-
 	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				connectChan <- fmt.Errorf("panic durante conexão: %v", r)
-			}
-		}()
-
-		err := client.Connect()
-		connectChan <- err
+		connectChan <- client.Connect()
 	}()
 
 	// Aguardar conexão com timeout de 30 segundos
 	select {
 	case err := <-connectChan:
 		if err != nil {
-			// Remover cliente com falha
-			m.mutex.Lock()
-			delete(m.clients, deviceID)
-			m.mutex.Unlock()
-			return fmt.Errorf("erro na conexão: %w", err)
+			// NOTIFICAÇÃO 2: Erro na conexão efetiva
+			if m.notificationService != nil {
+				device, dbErr := m.db.GetDeviceByID(deviceID)
+				if dbErr == nil && device != nil {
+					// Verificar tipo específico de erro
+					if strings.Contains(err.Error(), "Client outdated") {
+						// Extrair versão do cliente se possível
+						clientVersion := extractClientVersion(err.Error())
+						m.notificationService.NotifyClientOutdated(deviceID, device.Name, device.TenantID, clientVersion)
+					} else if strings.Contains(err.Error(), "websocket") {
+						m.notificationService.NotifyDeviceConnectionError(deviceID, device.Name, device.TenantID, err)
+					} else {
+						m.notificationService.NotifyDeviceConnectionError(deviceID, device.Name, device.TenantID, err)
+					}
+				}
+			}
+			return fmt.Errorf("falha na conexão: %w", err)
 		}
+
 		fmt.Printf("Dispositivo %d conectado com sucesso\n", deviceID)
 		return nil
+
 	case <-time.After(30 * time.Second):
-		// Timeout - remover cliente
-		m.mutex.Lock()
-		delete(m.clients, deviceID)
-		m.mutex.Unlock()
-		return fmt.Errorf("timeout na conexão após 30 segundos")
+		// NOTIFICAÇÃO 3: Timeout na conexão
+		if m.notificationService != nil {
+			device, dbErr := m.db.GetDeviceByID(deviceID)
+			if dbErr == nil && device != nil {
+				timeoutErr := fmt.Errorf("timeout na conexão após 30 segundos")
+				m.notificationService.NotifyDeviceConnectionError(deviceID, device.Name, device.TenantID, timeoutErr)
+			}
+		}
+		return fmt.Errorf("timeout ao conectar dispositivo %d", deviceID)
 	}
+}
+
+// Função auxiliar para extrair versão do cliente do erro
+func extractClientVersion(errorMsg string) string {
+	// Regex para encontrar padrões como "client version: 2.3000.1022192018"
+	re := regexp.MustCompile(`client version:\s*([0-9.]+)`)
+	matches := re.FindStringSubmatch(errorMsg)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	return "unknown"
 }
 
 // createClientWithRetry cria um cliente com tentativas de retry

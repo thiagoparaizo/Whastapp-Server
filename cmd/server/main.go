@@ -14,12 +14,18 @@ import (
 	"whatsapp-service/internal/api"
 	"whatsapp-service/internal/config"
 	"whatsapp-service/internal/database"
+	"whatsapp-service/internal/notification"
 	"whatsapp-service/internal/whatsapp"
 )
 
 func main() {
 	// Carregar configurações
 	cfg := config.Load()
+
+	// Validar configuração de email antes de inicializar
+	if err := cfg.ValidateEmailConfig(); err != nil {
+		log.Fatalf("Erro na configuração de email: %v", err)
+	}
 
 	// Configurar modo do Gin
 	if cfg.LogLevel != "DEBUG" {
@@ -36,6 +42,39 @@ func main() {
 	waMgr, err := whatsapp.NewManager(cfg.WhatsmeowConnStr, db)
 	if err != nil {
 		log.Fatalf("Erro ao criar gerenciador de WhatsApp: %v", err)
+	}
+
+	// Configurar sistema de notificações
+	var notificationService *notification.NotificationService
+	if cfg.NotificationsEnabled {
+		emailConfig := &notification.EmailConfig{
+			SMTPHost:     cfg.SMTPHost,
+			SMTPPort:     cfg.SMTPPort,
+			SMTPUser:     cfg.SMTPUser,
+			SMTPPassword: cfg.SMTPPassword,
+			FromEmail:    cfg.NotificationFromEmail,
+			ToEmails:     cfg.NotificationToEmails,
+		}
+
+		notificationService = notification.NewNotificationService(
+			db,
+			cfg.AssistantAPIURL,
+			emailConfig,
+			cfg.NotificationWebhookURL,
+		)
+
+		// NOVO: Testar configuração de email na inicialização
+		if err := testEmailConfiguration(notificationService); err != nil {
+			log.Printf("⚠️  AVISO: Configuração de email pode ter problemas: %v", err)
+			log.Printf("    Notificações por email podem falhar. Verifique as configurações SMTP.")
+		} else {
+			log.Printf("✅ Configuração de email validada com sucesso")
+		}
+
+		// Configurar notificações no manager
+		waMgr.SetNotificationService(notificationService)
+	} else {
+		log.Printf("ℹ️  Sistema de notificações desabilitado")
 	}
 
 	// Iniciar o gerenciador, incluindo processamento de webhooks
@@ -108,4 +147,42 @@ func main() {
 	}
 
 	log.Println("Servidor encerrado com sucesso")
+}
+
+// NOVA FUNÇÃO: Testar configuração de email na inicialização
+func testEmailConfiguration(ns *notification.NotificationService) error {
+	if ns == nil {
+		return fmt.Errorf("notification service não inicializado")
+	}
+
+	// Criar uma notificação de teste (não será enviada)
+	testNotification := &notification.DeviceNotification{
+		DeviceID:        0,
+		DeviceName:      "Test Device",
+		TenantID:        0,
+		Level:           notification.NotificationLevelInfo,
+		Type:            "system_startup_test",
+		Title:           "Teste de Configuração",
+		Message:         "Este é um teste de configuração do sistema de email",
+		Timestamp:       time.Now(),
+		SuggestedAction: "Nenhuma ação necessária - apenas teste",
+	}
+
+	// Testar apenas a construção do email (não enviar)
+	emails, err := ns.GetEmailsForNotification(testNotification)
+	if err != nil {
+		return fmt.Errorf("erro ao obter emails de destino: %w", err)
+	}
+
+	if len(emails) == 0 {
+		return fmt.Errorf("nenhum email de destino configurado")
+	}
+
+	// Verificar se o email sender foi inicializado corretamente
+	if ns.EmailSender == nil {
+		return fmt.Errorf("email sender não foi inicializado")
+	}
+
+	log.Printf("📧 Emails de destino configurados: %v", emails)
+	return nil
 }

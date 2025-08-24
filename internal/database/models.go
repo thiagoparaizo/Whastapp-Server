@@ -127,6 +127,33 @@ func CreateTableQueries() []string {
 		// `CREATE INDEX IF NOT EXISTS idx_webhook_configs_tenant ON webhook_configs(tenant_id)`,
 		// `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status ON webhook_deliveries(status)`,
 		// `CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_next_retry ON webhook_deliveries(next_retry_at)`,
+
+		// NOVA TABELA: notification_logs
+		`CREATE TABLE IF NOT EXISTS notification_logs (
+			id SERIAL PRIMARY KEY,
+			device_id BIGINT,
+			tenant_id BIGINT,
+			level VARCHAR(20) NOT NULL,
+			type VARCHAR(50) NOT NULL,
+			title VARCHAR(255) NOT NULL,
+			message TEXT NOT NULL,
+			error_code VARCHAR(50),
+			details JSONB,
+			suggested_action TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Índices para buscas rápidas
+		`CREATE INDEX IF NOT EXISTS idx_messages_device_jid ON whatsapp_messages(device_id, jid)`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON whatsapp_messages(timestamp)`,
+		`CREATE INDEX IF NOT EXISTS idx_tracked_entities_device ON tracked_entities(device_id)`,
+
+		// NOVOS ÍNDICES: para notification_logs
+		`CREATE INDEX IF NOT EXISTS idx_notification_logs_device_id ON notification_logs(device_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_logs_type ON notification_logs(type)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_logs_created_at ON notification_logs(created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_logs_level ON notification_logs(level)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_logs_tenant_id ON notification_logs(tenant_id)`,
 	}
 }
 
@@ -184,4 +211,19 @@ type WebhookDelivery struct {
 	NextRetryAt   time.Time `db:"next_retry_at"`
 	CreatedAt     time.Time `db:"created_at"`
 	LastUpdatedAt time.Time `db:"last_updated_at"`
+}
+
+// NotificationLog representa um log de notificação
+type NotificationLog struct {
+	ID              int64          `db:"id"`
+	DeviceID        sql.NullInt64  `db:"device_id"`
+	TenantID        sql.NullInt64  `db:"tenant_id"`
+	Level           string         `db:"level"`
+	Type            string         `db:"type"`
+	Title           string         `db:"title"`
+	Message         string         `db:"message"`
+	ErrorCode       sql.NullString `db:"error_code"`
+	Details         sql.NullString `db:"details"` // JSON como string
+	SuggestedAction sql.NullString `db:"suggested_action"`
+	CreatedAt       time.Time      `db:"created_at"`
 }

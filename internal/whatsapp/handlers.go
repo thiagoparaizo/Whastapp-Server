@@ -21,6 +21,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 
 	"whatsapp-service/internal/database"
+	"whatsapp-service/internal/notification"
 
 	"regexp"
 
@@ -44,9 +45,14 @@ type EventHandler struct {
 	DB            *database.DB
 	WebhookConfig *WebhookConfig
 	httpClient    *http.Client
-	Manager       *Manager
+	Manager       *Manager          // JÁ EXISTIA - perfeito!
 	lidCache      map[string]string // Cache LID -> PhoneNumber
 	lidMutex      sync.RWMutex
+
+	// NOVO: Adicionar apenas este campo para tracking de falhas
+	consecutiveFailures map[string]int // Track failures by webhook URL
+	failuresMutex       sync.RWMutex   // Mutex específico para failures
+
 }
 
 // cacheLIDMapping armazena mapeamento LID no cache
@@ -81,13 +87,25 @@ func NewEventHandler(db *database.DB, manager *Manager) *EventHandler {
 		httpClient: &http.Client{
 			Timeout: time.Second * 10,
 		},
-		Manager: manager,
+		Manager:  manager,                 // JÁ EXISTIA
+		lidCache: make(map[string]string), // Inicializar se não estava
+
+		// NOVO: Inicializar apenas o campo de failures
+		consecutiveFailures: make(map[string]int),
 	}
 }
 
 // SetWebhookConfig configura o webhook para envio de eventos
 func (h *EventHandler) SetWebhookConfig(config *WebhookConfig) {
 	h.WebhookConfig = config
+}
+
+// Método auxiliar para acessar notification service
+func (h *EventHandler) getNotificationService() *notification.NotificationService {
+	if h.Manager != nil {
+		return h.Manager.notificationService
+	}
+	return nil
 }
 
 // HandleEvent processa um evento do WhatsApp
@@ -936,7 +954,19 @@ func (h *EventHandler) sendToWebhook(deviceID int64, evt interface{}) {
 	if err != nil {
 		fmt.Printf("Erro ao enviar evento para webhook: %v\n", err)
 		h.logWebhookDeliveryFailure(deviceID, fmt.Sprintf("%T", evt), jsonData, 0, "", fmt.Sprintf("Erro ao enviar: %v", err))
-		// Agendar reenvio em background
+
+		// ADICIONAR APENAS ESTA PARTE - Tracking de falhas consecutivas
+		h.failuresMutex.Lock()
+		h.consecutiveFailures[h.WebhookConfig.URL]++
+		failures := h.consecutiveFailures[h.WebhookConfig.URL]
+		h.failuresMutex.Unlock()
+
+		// Notificar após muitas falhas consecutivas
+		if failures >= 5 && h.getNotificationService() != nil {
+			h.getNotificationService().NotifyWebhookDeliveryFailure(deviceID, h.WebhookConfig.URL, failures)
+		}
+
+		// Agendar reenvio em background - MANTER CÓDIGO EXISTENTE
 		go h.scheduleWebhookRetry(deviceID, fmt.Sprintf("%T", evt), jsonData)
 		return
 	}
@@ -950,14 +980,36 @@ func (h *EventHandler) sendToWebhook(deviceID int64, evt interface{}) {
 	if resp.StatusCode >= 400 {
 		fmt.Printf("Webhook retornou status de erro: %d\n", resp.StatusCode)
 		h.logWebhookDeliveryFailure(deviceID, fmt.Sprintf("%T", evt), jsonData, resp.StatusCode, responseStr, fmt.Sprintf("Status de erro: %d", resp.StatusCode))
-		// Agendar reenvio se for um erro temporário (5xx)
+
+		// ADICIONAR APENAS ESTA PARTE - Tracking para erros HTTP
+		h.failuresMutex.Lock()
+		h.consecutiveFailures[h.WebhookConfig.URL]++
+		failures := h.consecutiveFailures[h.WebhookConfig.URL]
+		h.failuresMutex.Unlock()
+
+		// Notificar após falhas consecutivas (menos tolerância para erros HTTP)
+		if failures >= 3 && h.getNotificationService() != nil {
+			h.getNotificationService().NotifyWebhookDeliveryFailure(deviceID, h.WebhookConfig.URL, failures)
+		}
+
+		// Agendar reenvio se for um erro temporário - MANTER CÓDIGO EXISTENTE
 		if resp.StatusCode >= 500 {
 			go h.scheduleWebhookRetry(deviceID, fmt.Sprintf("%T", evt), jsonData)
 		}
-	} else {
-		// Registrar sucesso
-		h.logWebhookDeliverySuccess(deviceID, fmt.Sprintf("%T", evt), jsonData, resp.StatusCode, responseStr)
+		return
 	}
+
+	// ADICIONAR APENAS ESTA PARTE - Reset contador em caso de sucesso
+	h.failuresMutex.Lock()
+	if h.consecutiveFailures[h.WebhookConfig.URL] > 0 {
+		fmt.Printf("Webhook URL %s voltou ao normal após %d falhas\n", h.WebhookConfig.URL, h.consecutiveFailures[h.WebhookConfig.URL])
+		h.consecutiveFailures[h.WebhookConfig.URL] = 0
+	}
+	h.failuresMutex.Unlock()
+
+	// Log de sucesso - MANTER CÓDIGO EXISTENTE SE JÁ EXISTIR
+	// ou adicionar apenas este printf se não existir:
+	fmt.Printf("Webhook entregue com sucesso para dispositivo %d\n", deviceID)
 }
 
 func (h *EventHandler) SendTestWebhook(url string, secret string, payload interface{}) (bool, error) {
@@ -1283,4 +1335,26 @@ func (h *EventHandler) ProcessPendingWebhooks() {
 			)
 		}
 	}
+}
+
+// Novo método para contar falhas consecutivas:
+func (h *EventHandler) getConsecutiveWebhookFailures(webhookURL string) int {
+	// Consultar banco para contar falhas consecutivas recentes
+	query := `
+		SELECT COUNT(*) FROM webhook_delivery_logs 
+		WHERE webhook_url = $1 
+		AND status = 'failed' 
+		AND created_at > $2
+		ORDER BY created_at DESC
+	`
+
+	cutoff := time.Now().Add(-1 * time.Hour) // Últimas 1 hora
+
+	var count int
+	err := h.DB.QueryRow(query, webhookURL, cutoff).Scan(&count)
+	if err != nil {
+		return 0
+	}
+
+	return count
 }
