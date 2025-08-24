@@ -1121,3 +1121,68 @@ func (db *DB) CleanupOldNotificationLogs(daysToKeep int) (int64, error) {
 	rowsAffected, err := result.RowsAffected()
 	return rowsAffected, err
 }
+
+// GetSystemAdminEmails busca emails de administradores do sistema
+func (db *DB) GetSystemAdminEmails(notificationLevel string) ([]string, error) {
+	query := `
+		SELECT email_address 
+		FROM system_admin_emails 
+		WHERE is_active = true 
+		AND ($1 = ANY(notification_types) OR 'all' = ANY(notification_types))
+		ORDER BY email_address
+	`
+
+	var emails []string
+	err := db.Select(&emails, query, notificationLevel)
+	return emails, err
+}
+
+// GetTenantNotificationEmails busca emails de notificação de um tenant
+func (db *DB) GetTenantNotificationEmails(tenantID int64, notificationLevel string) ([]string, error) {
+	query := `
+		SELECT DISTINCT email_address 
+		FROM notification_email_configs 
+		WHERE tenant_id = $1 
+		AND is_active = true 
+		AND ($2 = ANY(notification_types) OR 'all' = ANY(notification_types))
+		ORDER BY email_address
+	`
+
+	var emails []string
+	err := db.Select(&emails, query, tenantID, notificationLevel)
+	return emails, err
+}
+
+// AddSystemAdminEmail adiciona um email de admin do sistema
+func (db *DB) AddSystemAdminEmail(email, name string, notificationTypes []string) error {
+	query := `
+		INSERT INTO system_admin_emails (email_address, admin_name, notification_types, is_active)
+		VALUES ($1, $2, $3, true)
+		ON CONFLICT (email_address) DO UPDATE SET
+			admin_name = EXCLUDED.admin_name,
+			notification_types = EXCLUDED.notification_types,
+			updated_at = CURRENT_TIMESTAMP
+	`
+
+	_, err := db.Exec(query, email, name, pq.Array(notificationTypes))
+	return err
+}
+
+// AddTenantNotificationEmail adiciona um email de notificação para um tenant
+func (db *DB) AddTenantNotificationEmail(tenantID int64, emailType, email string, notificationTypes []string) error {
+	query := `
+		INSERT INTO notification_email_configs (tenant_id, email_type, email_address, notification_types, is_active)
+		VALUES ($1, $2, $3, $4, true)
+		ON CONFLICT (tenant_id, email_address, email_type) DO UPDATE SET
+			notification_types = EXCLUDED.notification_types,
+			updated_at = CURRENT_TIMESTAMP
+	`
+
+	_, err := db.Exec(query, tenantID, emailType, email, pq.Array(notificationTypes))
+	return err
+}
+
+// ==============================================
+// 5. SCRIPT DE INICIALIZAÇÃO DE DADOS
+// Adicionar método para popular dados iniciais
+// ==============================================

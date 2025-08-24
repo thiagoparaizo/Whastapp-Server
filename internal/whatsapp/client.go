@@ -263,14 +263,17 @@ func (c *Client) handleLoggedOut() {
 			fmt.Printf("Erro ao atualizar status do dispositivo: %v\n", err)
 		}
 
-		// IMPLEMENTAÇÃO DA NOTIFICAÇÃO
+		// NOTIFICAÇÃO DE REAUTENTICAÇÃO - VERIFICAR SE ESTÁ SENDO CHAMADA
 		if c.manager != nil && c.manager.notificationService != nil {
 			device, err := c.DB.GetDeviceByID(c.DeviceID)
 			if err == nil && device != nil {
+				fmt.Printf("🔔 Enviando notificação de reautenticação para dispositivo %d (%s)\n", c.DeviceID, device.Name)
 				c.manager.notificationService.NotifyDeviceRequiresReauth(c.DeviceID, device.Name, device.TenantID)
 			} else {
-				fmt.Printf("Erro ao buscar dispositivo para notificação: %v\n", err)
+				fmt.Printf("❌ Erro ao buscar dispositivo para notificação: %v\n", err)
 			}
+		} else {
+			fmt.Printf("⚠️  NotificationService não disponível para dispositivo %d\n", c.DeviceID)
 		}
 	}()
 

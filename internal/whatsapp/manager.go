@@ -242,6 +242,14 @@ func (m *Manager) GetQRChannel(ctx context.Context, deviceID int64) (<-chan stri
 	return client.GetQRChannel(ctx)
 }
 
+// Método auxiliar para acessar notification service
+func (h *EventHandler) GetNotificationService2() *notification.NotificationService {
+	if h.Manager != nil {
+		return h.Manager.notificationService
+	}
+	return nil
+}
+
 // SendTextMessage envia uma mensagem de texto de um dispositivo específico
 func (m *Manager) SendTextMessage(deviceID int64, to string, text string) (string, error) {
 	client, err := m.GetClient(deviceID)
@@ -361,6 +369,22 @@ func (m *Manager) ConnectAllApproved() {
 		} else {
 			fmt.Printf("Dispositivo %d (%s) aguardando QR Code (sem JID ou requer reauth)\n",
 				device.ID, device.Name)
+		}
+	}
+
+	// Buscar dispositivos que necessitam reautenticação e notificar
+	reauthDevices, err := m.db.GetDevicesRequiringReauth()
+	if err != nil {
+		fmt.Printf("Erro ao buscar dispositivos que requerem reauth: %v\n", err)
+	} else if len(reauthDevices) > 0 {
+		fmt.Printf("Encontrados %d dispositivos que necessitam reautenticação\n", len(reauthDevices))
+
+		// Notificar sobre cada dispositivo que precisa de reauth
+		for _, device := range reauthDevices {
+			if m.notificationService != nil {
+				fmt.Printf("🔔 Notificando reautenticação necessária para dispositivo %d (%s)\n", device.ID, device.Name)
+				m.notificationService.NotifyDeviceRequiresReauth(device.ID, device.Name, device.TenantID)
+			}
 		}
 	}
 }

@@ -483,18 +483,61 @@ func (ns *NotificationService) GetEmailsForNotification(notification *DeviceNoti
 	return uniqueEmails, nil
 }
 
-// Métodos auxiliares para buscar emails
+// getSystemAdminEmails
 func (ns *NotificationService) getSystemAdminEmails() []string {
-	// Implementar busca de emails de admin do sistema
-	// Por enquanto, retornar da configuração
-	// TODO: Buscar do banco de dados ou configuração
-	return []string{"thiagoparaizo@gmail.com"}
+	// Primeiro, tentar buscar do banco de dados
+	if ns.db != nil {
+		emails, err := ns.db.GetSystemAdminEmails("critical") // Para alertas críticos
+		if err == nil && len(emails) > 0 {
+			return emails
+		}
+
+		// Log do erro mas continue com fallback
+		if err != nil {
+			fmt.Printf("Erro ao buscar emails de admin do banco: %v\n", err)
+		}
+	}
+
+	// Fallback: buscar da configuração de ambiente
+	// Assumindo que existe uma forma de acessar a config
+	// Por enquanto, hardcoded - mas deveria vir da config
+	fallbackEmails := []string{
+		"thiagoparaizo@gmail.com", // Seu email como fallback
+	}
+
+	return fallbackEmails
 }
 
 func (ns *NotificationService) getTenantNotificationEmails(tenantID int64) ([]string, error) {
-	// Implementar busca de emails de notificação do tenant
-	// TODO: Buscar do banco de dados
-	return []string{}, nil
+	if ns.db == nil {
+		return []string{}, fmt.Errorf("database não configurado")
+	}
+
+	// Buscar emails do tenant para diferentes níveis
+	var allEmails []string
+
+	// Buscar emails para críticos e erros
+	criticalEmails, err := ns.db.GetTenantNotificationEmails(tenantID, "critical")
+	if err == nil {
+		allEmails = append(allEmails, criticalEmails...)
+	}
+
+	errorEmails, err := ns.db.GetTenantNotificationEmails(tenantID, "error")
+	if err == nil {
+		allEmails = append(allEmails, errorEmails...)
+	}
+
+	// Remover duplicatas
+	emailSet := make(map[string]bool)
+	var uniqueEmails []string
+	for _, email := range allEmails {
+		if email != "" && !emailSet[email] {
+			emailSet[email] = true
+			uniqueEmails = append(uniqueEmails, email)
+		}
+	}
+
+	return uniqueEmails, nil
 }
 
 func (ns *NotificationService) buildEmailBody(notification *DeviceNotification) string {

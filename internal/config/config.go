@@ -37,19 +37,33 @@ type Config struct {
 func Load() Config {
 	err := godotenv.Load()
 	if err != nil {
-		log.Print("Erro ao carregar o arquivo .env")
+		log.Print("Erro ao carregar o arquivo .env (normal em container)")
+		log.Print("Lendo variáveis diretamente do ambiente...")
 	}
 
 	log.Print("Carregando configurações...")
 
-	// Parse emails (separados por vírgula)
+	// Parse emails (separados por vírgula) - com debug
 	toEmails := []string{}
-	if emailsStr := getEnv("NOTIFICATION_TO_EMAILS", ""); emailsStr != "" {
+	emailsStr := getEnv("NOTIFICATION_TO_EMAILS", "")
+	log.Printf("DEBUG: NOTIFICATION_TO_EMAILS = '%s'", emailsStr)
+
+	if emailsStr != "" {
 		toEmails = strings.Split(emailsStr, ",")
 		for i, email := range toEmails {
 			toEmails[i] = strings.TrimSpace(email)
 		}
+		log.Printf("DEBUG: Emails parseados: %v", toEmails)
+	} else {
+		log.Printf("⚠️  NOTIFICATION_TO_EMAILS não configurado")
 	}
+
+	// Debug outras variáveis importantes
+	smtpHost := getEnv("SMTP_HOST", "")
+	smtpUser := getEnv("SMTP_USER", "")
+	log.Printf("DEBUG: SMTP_HOST = '%s'", smtpHost)
+	log.Printf("DEBUG: SMTP_USER = '%s'", smtpUser)
+	log.Printf("DEBUG: NOTIFICATIONS_ENABLED = '%s'", getEnv("NOTIFICATIONS_ENABLED", "true"))
 
 	return Config{
 		Host:              getEnv("HOST", "0.0.0.0"),
@@ -63,9 +77,9 @@ func Load() Config {
 
 		// Notificações
 		NotificationWebhookURL: getEnv("NOTIFICATION_WEBHOOK_URL", ""),
-		SMTPHost:               getEnv("SMTP_HOST", ""),
+		SMTPHost:               smtpHost,
 		SMTPPort:               getEnvInt("SMTP_PORT", 587),
-		SMTPUser:               getEnv("SMTP_USER", ""),
+		SMTPUser:               smtpUser,
 		SMTPPassword:           getEnv("SMTP_PASSWORD", ""),
 		NotificationFromEmail:  getEnv("NOTIFICATION_FROM_EMAIL", ""),
 		NotificationToEmails:   toEmails,

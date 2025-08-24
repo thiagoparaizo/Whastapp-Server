@@ -143,6 +143,30 @@ func CreateTableQueries() []string {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
 
+		// NOVA TABELA: configurações de email por tenant
+		`CREATE TABLE IF NOT EXISTS notification_email_configs (
+			id SERIAL PRIMARY KEY,
+			tenant_id BIGINT NOT NULL,
+			email_type VARCHAR(50) NOT NULL, -- 'admin', 'technical', 'billing', etc.
+			email_address VARCHAR(255) NOT NULL,
+			is_active BOOLEAN NOT NULL DEFAULT TRUE,
+			notification_types TEXT[], -- array de tipos de notificação: ['critical', 'error', 'warning']
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(tenant_id, email_address, email_type)
+		)`,
+
+		// NOVA TABELA: emails de admin do sistema (global)
+		`CREATE TABLE IF NOT EXISTS system_admin_emails (
+			id SERIAL PRIMARY KEY,
+			email_address VARCHAR(255) NOT NULL UNIQUE,
+			admin_name VARCHAR(255),
+			is_active BOOLEAN NOT NULL DEFAULT TRUE,
+			notification_types TEXT[] DEFAULT ARRAY['critical', 'error'], -- tipos que este admin recebe
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+
 		// Índices para buscas rápidas
 		`CREATE INDEX IF NOT EXISTS idx_messages_device_jid ON whatsapp_messages(device_id, jid)`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON whatsapp_messages(timestamp)`,
@@ -154,6 +178,9 @@ func CreateTableQueries() []string {
 		`CREATE INDEX IF NOT EXISTS idx_notification_logs_created_at ON notification_logs(created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_logs_level ON notification_logs(level)`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_logs_tenant_id ON notification_logs(tenant_id)`,
+
+		`CREATE INDEX IF NOT EXISTS idx_notification_email_configs_tenant ON notification_email_configs(tenant_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_system_admin_emails_active ON system_admin_emails(is_active)`,
 	}
 }
 
@@ -226,4 +253,27 @@ type NotificationLog struct {
 	Details         sql.NullString `db:"details"` // JSON como string
 	SuggestedAction sql.NullString `db:"suggested_action"`
 	CreatedAt       time.Time      `db:"created_at"`
+}
+
+// NotificationEmailConfig representa uma configuração de email para notificações
+type NotificationEmailConfig struct {
+	ID                int64          `db:"id"`
+	TenantID          int64          `db:"tenant_id"`
+	EmailType         string         `db:"email_type"` // admin, technical, billing
+	EmailAddress      string         `db:"email_address"`
+	IsActive          bool           `db:"is_active"`
+	NotificationTypes pq.StringArray `db:"notification_types"` // critical, error, warning, info
+	CreatedAt         time.Time      `db:"created_at"`
+	UpdatedAt         time.Time      `db:"updated_at"`
+}
+
+// SystemAdminEmail representa um email de admin do sistema
+type SystemAdminEmail struct {
+	ID                int64          `db:"id"`
+	EmailAddress      string         `db:"email_address"`
+	AdminName         string         `db:"admin_name"`
+	IsActive          bool           `db:"is_active"`
+	NotificationTypes pq.StringArray `db:"notification_types"`
+	CreatedAt         time.Time      `db:"created_at"`
+	UpdatedAt         time.Time      `db:"updated_at"`
 }
