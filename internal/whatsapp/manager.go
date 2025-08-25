@@ -628,18 +628,18 @@ func (m *Manager) CleanCorruptedSessions() error {
 
 // Método para verificar saúde dos clientes conectados
 func (m *Manager) HealthCheckClients() {
-	log.Info().Msg("HealthCheckClients INIT: Verificando saúde dos clientes conectados...")
+	log.Printf("HealthCheckClients INIT: Verificando saúde dos clientes conectados...")
 	//fmt.Println("HealthCheckClients INIT: Verificando saúde dos clientes conectados...")
 
 	for deviceID, client := range m.clients {
 		if client == nil || client.Client == nil {
-			fmt.Printf("Cliente inválido encontrado para dispositivo %d, removendo\n", deviceID)
+			log.Printf("Cliente inválido encontrado para dispositivo %d, removendo\n", deviceID)
 			delete(m.clients, deviceID)
 			continue
 		}
 
 		if !client.IsConnected() {
-			fmt.Printf("Cliente desconectado encontrado para dispositivo %d, removendo\n", deviceID)
+			log.Printf("Cliente desconectado encontrado para dispositivo %d, removendo\n", deviceID)
 			delete(m.clients, deviceID)
 
 			// Atualizar status no banco
@@ -653,23 +653,23 @@ func (m *Manager) HealthCheckClients() {
 	}
 
 	// Buscar dispositivos que necessitam reautenticação e notificar
-	log.Info().Msg("Buscando dispositivos que precisam de reautenticação...")
+	log.Printf("Buscando dispositivos que precisam de reautenticação...")
 	reauthDevices, err := m.db.GetDevicesRequiringReauth()
 	if err != nil {
-		fmt.Printf("Erro ao buscar dispositivos que requerem reauth: %v\n", err)
+		log.Printf("Erro ao buscar dispositivos que requerem reauth: %v\n", err)
 	} else if len(reauthDevices) > 0 {
-		fmt.Printf("Encontrados %d dispositivos que necessitam reautenticação\n", len(reauthDevices))
+		log.Printf("Encontrados %d dispositivos que necessitam reautenticação\n", len(reauthDevices))
 
 		// Notificar sobre cada dispositivo que precisa de reauth
 		for _, device := range reauthDevices {
 			if m.notificationService != nil {
-				fmt.Printf("🔔 Notificando reautenticação necessária para dispositivo %d (%s)\n", device.ID, device.Name)
+				log.Printf("🔔 Notificando reautenticação necessária para dispositivo %d (%s)\n", device.ID, device.Name)
 				m.notificationService.NotifyDeviceRequiresReauth(device.ID, device.Name, device.TenantID)
 			}
 		}
 	}
 
-	log.Info().Msg("HealthCheckClients END")
+	log.Printf("HealthCheckClients END")
 }
 
 // Adicionar ao método de inicialização do Manager
