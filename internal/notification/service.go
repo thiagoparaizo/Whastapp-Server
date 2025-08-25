@@ -83,15 +83,18 @@ func NewNotificationService(db *database.DB, assistantAPIURL string, emailConfig
 func (ns *NotificationService) SendDeviceNotification(notification *DeviceNotification) error {
 	fmt.Printf("📤 Processando notificação %s para dispositivo %d\n", notification.Type, notification.DeviceID)
 
-	// 1. Salvar no banco de dados para auditoria
-	if err := ns.saveNotificationLog(notification); err != nil {
-		fmt.Printf("Erro ao salvar log de notificação: %v\n", err)
-	}
-
-	// 2. Verificar se deve notificar (evitar spam)
+	// 1. PRIMEIRO: Verificar se deve notificar (ANTES de salvar)
 	if !ns.shouldNotifyAdvanced(notification) {
 		fmt.Printf("❌ Notificação ignorada (cooldown): %s para dispositivo %d\n", notification.Type, notification.DeviceID)
 		return nil
+	}
+
+	fmt.Printf("✅ Cooldown OK, processando notificação %s para dispositivo %d\n", notification.Type, notification.DeviceID)
+
+	// 2. DEPOIS: Salvar no banco de dados para auditoria (apenas se vai notificar)
+	if err := ns.saveNotificationLog(notification); err != nil {
+		fmt.Printf("Erro ao salvar log de notificação: %v\n", err)
+		// Continua mesmo com erro de log - não deve impedir a notificação
 	}
 
 	fmt.Printf("✅ Cooldown OK, enviando notificação %s para dispositivo %d\n", notification.Type, notification.DeviceID)
@@ -610,22 +613,24 @@ type CooldownConfig struct {
 // shouldNotifyAdvanced versão melhorada com configuração flexível
 func (ns *NotificationService) shouldNotifyAdvanced(notification *DeviceNotification) bool {
 	if ns.db == nil {
+		fmt.Printf("⚠️ Banco de dados não configurado, permitindo notificação\n")
 		return true
 	}
 
 	// Configuração de cooldown
 	cooldownConfig := CooldownConfig{
 		DefaultMinutes:  30,
-		CriticalMinutes: 15,
+		CriticalMinutes: 10,
 		TypeSpecific: map[string]int{
-			"client_outdated":          15, // Muito crítico, pouco cooldown
-			"device_requires_reauth":   60, // Menos crítico, cooldown maior
-			"device_connection_error":  30, // Moderado
-			"webhook_delivery_failure": 60, // Default
-			"device_disconnected":      45, // Menos urgente
+			"client_outdated":          10, // Muito crítico, pouco cooldown
+			"device_requires_reauth":   30, // Moderado
+			"device_connection_error":  15, // Moderado
+			"webhook_delivery_failure": 60, // Longo
+			"device_disconnected":      45, // Longo
 		},
 	}
 
+	// Query para buscar a PENÚLTIMA notificação (não a atual que pode ter sido inserida)
 	query := `
 		SELECT created_at 
 		FROM notification_logs 
@@ -638,10 +643,13 @@ func (ns *NotificationService) shouldNotifyAdvanced(notification *DeviceNotifica
 	var cooldownMinutes int
 	if specificCooldown, exists := cooldownConfig.TypeSpecific[notification.Type]; exists {
 		cooldownMinutes = specificCooldown
+		fmt.Printf("🔧 Usando cooldown específico para %s: %d minutos\n", notification.Type, cooldownMinutes)
 	} else if notification.Level == NotificationLevelCritical {
 		cooldownMinutes = cooldownConfig.CriticalMinutes
+		fmt.Printf("🚨 Usando cooldown crítico: %d minutos\n", cooldownMinutes)
 	} else {
 		cooldownMinutes = cooldownConfig.DefaultMinutes
+		fmt.Printf("⏰ Usando cooldown padrão: %d minutos\n", cooldownMinutes)
 	}
 
 	var lastNotificationTime time.Time
@@ -654,18 +662,26 @@ func (ns *NotificationService) shouldNotifyAdvanced(notification *DeviceNotifica
 			return true
 		}
 
-		fmt.Printf("⚠️ Erro ao verificar cooldown, permitindo notificação: %v\n", err)
+		fmt.Printf("⚠️ Erro ao verificar cooldown: %v - Permitindo notificação\n", err)
 		return true
 	}
 
-	timeSinceLastNotification := time.Since(lastNotificationTime)
+	// Debug detalhado dos tempos
+	now := time.Now()
+	timeSinceLastNotification := now.Sub(lastNotificationTime)
 	cooldownDuration := time.Duration(cooldownMinutes) * time.Minute
-
 	shouldNotify := timeSinceLastNotification >= cooldownDuration
 
+	fmt.Printf("⏱️ DEBUG COOLDOWN:\n")
+	fmt.Printf("   Agora: %s\n", now.Format("2006-01-02 15:04:05"))
+	fmt.Printf("   Última notificação: %s\n", lastNotificationTime.Format("2006-01-02 15:04:05"))
+	fmt.Printf("   Tempo transcorrido: %v\n", timeSinceLastNotification.Round(time.Second))
+	fmt.Printf("   Cooldown necessário: %v\n", cooldownDuration)
+	fmt.Printf("   Pode notificar: %v\n", shouldNotify)
+
 	if shouldNotify {
-		fmt.Printf("✅ Cooldown expirado (%v >= %v) para %s dispositivo %d - PERMITIDA\n",
-			timeSinceLastNotification.Round(time.Minute), cooldownDuration, notification.Type, notification.DeviceID)
+		fmt.Printf("✅ Cooldown expirado para %s dispositivo %d - PERMITIDA\n",
+			notification.Type, notification.DeviceID)
 	} else {
 		timeRemaining := cooldownDuration - timeSinceLastNotification
 		fmt.Printf("❌ Cooldown ativo para %s dispositivo %d - faltam %v - IGNORADA\n",
