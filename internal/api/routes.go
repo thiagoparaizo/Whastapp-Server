@@ -65,6 +65,9 @@ func SetupRoutes(router *gin.Engine, handler *Handler) {
 		api.POST("/notifications/test-reauth", handler.TriggerTestReauthNotification)
 		api.POST("/notifications/force", handler.ForceNotification)
 
+		// Debug de cooldown
+		api.GET("/notifications/debug-cooldown", handler.DebugCooldown)
+
 	}
 }
 

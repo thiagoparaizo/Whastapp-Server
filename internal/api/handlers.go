@@ -1176,7 +1176,7 @@ func (h *Handler) ForceNotification(c *gin.Context) {
 		return
 	}
 
-	// Criar notificação baseada no tipo - USANDO TIPOS CORRETOS
+	// Criar notificação baseada no tipo
 	var notificationObj *notification.DeviceNotification
 	switch request.Type {
 	case "device_requires_reauth":
@@ -1238,11 +1238,13 @@ func (h *Handler) ForceNotification(c *gin.Context) {
 		return
 	}
 
-	// Enviar notificação (forçada ou normal)
+	// CORREÇÃO PRINCIPAL: Usar método correto baseado no parâmetro force
 	var sendErr error
 	if request.Force {
-		sendErr = notificationService.SendDeviceNotification(notificationObj)
+		fmt.Printf("🚨 FORÇANDO notificação via API: %s para dispositivo %d\n", request.Type, device.ID)
+		sendErr = notificationService.SendDeviceNotificationForced(notificationObj)
 	} else {
+		fmt.Printf("📤 Enviando notificação normal via API: %s para dispositivo %d\n", request.Type, device.ID)
 		sendErr = notificationService.SendDeviceNotification(notificationObj)
 	}
 
@@ -1352,5 +1354,69 @@ func (h *Handler) TriggerTestReauthNotification(c *gin.Context) {
 		"message":     fmt.Sprintf("Notificação de reauth enviada para dispositivo %s", device.Name),
 		"device_id":   device.ID,
 		"device_name": device.Name,
+	})
+}
+
+func (h *Handler) DebugCooldown(c *gin.Context) {
+	deviceIDStr := c.Query("device_id")
+	notificationType := c.Query("type")
+
+	if deviceIDStr == "" || notificationType == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "device_id e type são obrigatórios"})
+		return
+	}
+
+	deviceID, err := strconv.ParseInt(deviceIDStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "device_id inválido"})
+		return
+	}
+
+	// Buscar última notificação deste tipo
+	query := `
+		SELECT created_at 
+		FROM notification_logs 
+		WHERE device_id = $1 AND type = $2 
+		ORDER BY created_at DESC 
+		LIMIT 1
+	`
+
+	var lastNotificationTime time.Time
+	err = h.DB.QueryRow(query, deviceID, notificationType).Scan(&lastNotificationTime)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusOK, gin.H{
+				"device_id":  deviceID,
+				"type":       notificationType,
+				"status":     "no_previous_notifications",
+				"can_notify": true,
+			})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Calcular cooldown
+	timeSinceLastNotification := time.Since(lastNotificationTime)
+	cooldownMinutes := 60 // device_requires_reauth tem 60 min de cooldown
+	cooldownDuration := time.Duration(cooldownMinutes) * time.Minute
+	canNotify := timeSinceLastNotification >= cooldownDuration
+	timeRemaining := cooldownDuration - timeSinceLastNotification
+
+	c.JSON(http.StatusOK, gin.H{
+		"device_id":         deviceID,
+		"type":              notificationType,
+		"last_notification": lastNotificationTime,
+		"time_since_last":   timeSinceLastNotification.String(),
+		"cooldown_duration": cooldownDuration.String(),
+		"time_remaining":    timeRemaining.String(),
+		"can_notify":        canNotify,
+		"status": map[string]interface{}{
+			"cooldown_active":   !canNotify,
+			"minutes_remaining": int(timeRemaining.Minutes()),
+		},
 	})
 }

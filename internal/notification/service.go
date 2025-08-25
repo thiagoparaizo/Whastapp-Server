@@ -81,6 +81,8 @@ func NewNotificationService(db *database.DB, assistantAPIURL string, emailConfig
 
 // SendDeviceNotification envia uma notificação sobre um dispositivo
 func (ns *NotificationService) SendDeviceNotification(notification *DeviceNotification) error {
+	fmt.Printf("📤 Processando notificação %s para dispositivo %d\n", notification.Type, notification.DeviceID)
+
 	// 1. Salvar no banco de dados para auditoria
 	if err := ns.saveNotificationLog(notification); err != nil {
 		fmt.Printf("Erro ao salvar log de notificação: %v\n", err)
@@ -88,9 +90,11 @@ func (ns *NotificationService) SendDeviceNotification(notification *DeviceNotifi
 
 	// 2. Verificar se deve notificar (evitar spam)
 	if !ns.shouldNotifyAdvanced(notification) {
-		fmt.Printf("Notificação ignorada (cooldown): %s para dispositivo %d\n", notification.Type, notification.DeviceID)
+		fmt.Printf("❌ Notificação ignorada (cooldown): %s para dispositivo %d\n", notification.Type, notification.DeviceID)
 		return nil
 	}
+
+	fmt.Printf("✅ Cooldown OK, enviando notificação %s para dispositivo %d\n", notification.Type, notification.DeviceID)
 
 	// 3. Enviar para API principal (Python)
 	if err := ns.sendToAssistantAPI(notification); err != nil {
@@ -111,6 +115,7 @@ func (ns *NotificationService) SendDeviceNotification(notification *DeviceNotifi
 		}
 	}
 
+	fmt.Printf("✅ Notificação normal processada com sucesso\n")
 	return nil
 }
 
@@ -668,4 +673,40 @@ func (ns *NotificationService) shouldNotifyAdvanced(notification *DeviceNotifica
 	}
 
 	return shouldNotify
+}
+
+// SendDeviceNotificationForced envia notificação ignorando cooldown
+func (ns *NotificationService) SendDeviceNotificationForced(notification *DeviceNotification) error {
+	fmt.Printf("🚨 FORÇANDO notificação %s para dispositivo %d (ignorando cooldown)\n",
+		notification.Type, notification.DeviceID)
+
+	// 1. Salvar no banco de dados para auditoria (sempre salvar)
+	if err := ns.saveNotificationLog(notification); err != nil {
+		fmt.Printf("Erro ao salvar log de notificação: %v\n", err)
+	}
+
+	// 2. PULAR verificação de cooldown quando forçado
+	fmt.Printf("⏭️ Pulando verificação de cooldown (forçado)\n")
+
+	// 3. Enviar para API principal (Python)
+	if err := ns.sendToAssistantAPI(notification); err != nil {
+		fmt.Printf("Erro ao enviar notificação para API principal: %v\n", err)
+	}
+
+	// 4. Enviar por webhook se configurado
+	if ns.webhookURL != "" {
+		if err := ns.sendWebhookNotification(notification); err != nil {
+			fmt.Printf("Erro ao enviar notificação por webhook: %v\n", err)
+		}
+	}
+
+	// 5. Enviar por email SEMPRE quando forçado (independente do nível)
+	if err := ns.sendEmailNotification(notification); err != nil {
+		fmt.Printf("Erro ao enviar notificação por email: %v\n", err)
+	} else {
+		fmt.Printf("✅ Email de notificação forçada enviado\n")
+	}
+
+	fmt.Printf("✅ Notificação forçada processada com sucesso\n")
+	return nil
 }
