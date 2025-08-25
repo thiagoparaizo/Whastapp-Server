@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -627,7 +628,8 @@ func (m *Manager) CleanCorruptedSessions() error {
 
 // Método para verificar saúde dos clientes conectados
 func (m *Manager) HealthCheckClients() {
-	fmt.Println("HealthCheckClients INIT: Verificando saúde dos clientes conectados...")
+	log.Info().Msg("HealthCheckClients INIT: Verificando saúde dos clientes conectados...")
+	//fmt.Println("HealthCheckClients INIT: Verificando saúde dos clientes conectados...")
 
 	for deviceID, client := range m.clients {
 		if client == nil || client.Client == nil {
@@ -651,7 +653,7 @@ func (m *Manager) HealthCheckClients() {
 	}
 
 	// Buscar dispositivos que necessitam reautenticação e notificar
-	fmt.Println("Buscando dispositivos que precisam de reautenticação...")
+	log.Info().Msg("Buscando dispositivos que precisam de reautenticação...")
 	reauthDevices, err := m.db.GetDevicesRequiringReauth()
 	if err != nil {
 		fmt.Printf("Erro ao buscar dispositivos que requerem reauth: %v\n", err)
@@ -667,7 +669,7 @@ func (m *Manager) HealthCheckClients() {
 		}
 	}
 
-	fmt.Println("HealthCheckClients END")
+	log.Info().Msg("HealthCheckClients END")
 }
 
 // Adicionar ao método de inicialização do Manager
