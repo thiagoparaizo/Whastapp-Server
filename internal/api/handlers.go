@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"whatsapp-service/internal/database"
+	"whatsapp-service/internal/notification"
 	"whatsapp-service/internal/whatsapp"
 )
 
@@ -1149,4 +1150,207 @@ func generateRecommendations(consistency []map[string]interface{}, orphanDevices
 	}
 
 	return recommendations
+}
+
+func (h *Handler) ForceNotification(c *gin.Context) {
+	var request struct {
+		DeviceID int64  `json:"device_id" binding:"required"`
+		Type     string `json:"type" binding:"required"`
+		Force    bool   `json:"force"` // true = ignorar cooldown
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	device, err := h.DB.GetDeviceByID(request.DeviceID)
+	if err != nil || device == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Dispositivo não encontrado"})
+		return
+	}
+
+	notificationService := h.WhatsAppMgr.GetNotificationService()
+	if notificationService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Serviço de notificação não disponível"})
+		return
+	}
+
+	// Criar notificação baseada no tipo - USANDO TIPOS CORRETOS
+	var notificationObj *notification.DeviceNotification
+	switch request.Type {
+	case "device_requires_reauth":
+		notificationObj = &notification.DeviceNotification{
+			DeviceID:        device.ID,
+			DeviceName:      device.Name,
+			TenantID:        device.TenantID,
+			Level:           notification.NotificationLevelWarning,
+			Type:            "device_requires_reauth",
+			Title:           "Dispositivo Requer Reautenticação (FORÇADO)",
+			Message:         fmt.Sprintf("Dispositivo %s (ID: %d) necessita ser reautenticado", device.Name, device.ID),
+			Timestamp:       time.Now(),
+			ErrorCode:       "REAUTH_REQUIRED",
+			SuggestedAction: "Gerar novo QR Code para reconectar o dispositivo",
+			Details: map[string]interface{}{
+				"forced":        request.Force,
+				"api_triggered": true,
+			},
+		}
+	case "device_connection_error":
+		notificationObj = &notification.DeviceNotification{
+			DeviceID:        device.ID,
+			DeviceName:      device.Name,
+			TenantID:        device.TenantID,
+			Level:           notification.NotificationLevelError,
+			Type:            "device_connection_error",
+			Title:           "Erro de Conexão (FORÇADO)",
+			Message:         fmt.Sprintf("Dispositivo %s (ID: %d) com erro de conexão", device.Name, device.ID),
+			Timestamp:       time.Now(),
+			ErrorCode:       "CONNECTION_FAILED",
+			SuggestedAction: "Verificar status da rede e tentar reconectar",
+			Details: map[string]interface{}{
+				"forced":        request.Force,
+				"api_triggered": true,
+			},
+		}
+	case "client_outdated":
+		notificationObj = &notification.DeviceNotification{
+			DeviceID:        device.ID,
+			DeviceName:      device.Name,
+			TenantID:        device.TenantID,
+			Level:           notification.NotificationLevelCritical,
+			Type:            "client_outdated",
+			Title:           "Cliente Desatualizado (FORÇADO)",
+			Message:         fmt.Sprintf("Dispositivo %s (ID: %d) usando versão desatualizada", device.Name, device.ID),
+			Timestamp:       time.Now(),
+			ErrorCode:       "CLIENT_OUTDATED_405",
+			SuggestedAction: "Atualizar biblioteca whatsmeow",
+			Details: map[string]interface{}{
+				"forced":        request.Force,
+				"api_triggered": true,
+			},
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":           "Tipo de notificação não suportado",
+			"supported_types": []string{"device_requires_reauth", "device_connection_error", "client_outdated"},
+		})
+		return
+	}
+
+	// Enviar notificação (forçada ou normal)
+	var sendErr error
+	if request.Force {
+		sendErr = notificationService.SendDeviceNotification(notificationObj)
+	} else {
+		sendErr = notificationService.SendDeviceNotification(notificationObj)
+	}
+
+	if sendErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Erro ao enviar notificação",
+			"details": sendErr.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":      "success",
+		"message":     fmt.Sprintf("Notificação %s enviada para dispositivo %s", request.Type, device.Name),
+		"device_id":   device.ID,
+		"device_name": device.Name,
+		"type":        request.Type,
+		"forced":      request.Force,
+		"timestamp":   time.Now(),
+	})
+}
+
+func (h *Handler) GetNotificationStatus(c *gin.Context) {
+	status := gin.H{
+		"notification_service_enabled": h.WhatsAppMgr.GetNotificationService() != nil,
+		"timestamp":                    time.Now(),
+	}
+
+	// Verificar dispositivos que precisam de reauth
+	reauthDevices, err := h.DB.GetDevicesRequiringReauth()
+	if err != nil {
+		status["error"] = err.Error()
+	} else {
+		status["devices_requiring_reauth"] = len(reauthDevices)
+
+		if len(reauthDevices) > 0 {
+			var deviceList []gin.H
+			for _, device := range reauthDevices {
+				deviceList = append(deviceList, gin.H{
+					"id":              device.ID,
+					"name":            device.Name,
+					"tenant_id":       device.TenantID,
+					"requires_reauth": device.RequiresReauth,
+				})
+			}
+			status["reauth_devices"] = deviceList
+		}
+	}
+
+	// Verificar emails configurados do sistema
+	if h.DB != nil {
+		systemEmails, err := h.DB.GetSystemAdminEmails("all")
+		if err == nil {
+			status["system_admin_emails_count"] = len(systemEmails)
+			status["system_admin_emails"] = systemEmails
+		} else {
+			status["email_config_error"] = err.Error()
+		}
+
+		// Verificar últimas notificações
+		logs, err := h.DB.GetNotificationLogs(nil, nil, "", "", 10)
+		if err == nil {
+			status["recent_notifications_count"] = len(logs)
+			var recentLogs []gin.H
+			for _, log := range logs {
+				recentLogs = append(recentLogs, gin.H{
+					"device_id":  log.DeviceID,
+					"type":       log.Type,
+					"level":      log.Level,
+					"created_at": log.CreatedAt,
+				})
+			}
+			status["recent_notifications"] = recentLogs
+		}
+	}
+
+	c.JSON(http.StatusOK, status)
+}
+
+func (h *Handler) TriggerTestReauthNotification(c *gin.Context) {
+	var request struct {
+		DeviceID int64 `json:"device_id" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	device, err := h.DB.GetDeviceByID(request.DeviceID)
+	if err != nil || device == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Dispositivo não encontrado"})
+		return
+	}
+
+	notificationService := h.WhatsAppMgr.GetNotificationService()
+	if notificationService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Serviço de notificação não disponível"})
+		return
+	}
+
+	// Usar o método direto do notification service
+	notificationService.NotifyDeviceRequiresReauth(device.ID, device.Name, device.TenantID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":      "success",
+		"message":     fmt.Sprintf("Notificação de reauth enviada para dispositivo %s", device.Name),
+		"device_id":   device.ID,
+		"device_name": device.Name,
+	})
 }

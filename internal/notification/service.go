@@ -22,7 +22,7 @@ type NotificationService struct {
 	assistantAPIURL string
 	httpClient      *http.Client
 	EmailSender     *EmailSender
-	emailConfig     *EmailConfig
+	mailConfig      *EmailConfig
 	webhookURL      string
 }
 
@@ -87,7 +87,7 @@ func (ns *NotificationService) SendDeviceNotification(notification *DeviceNotifi
 	}
 
 	// 2. Verificar se deve notificar (evitar spam)
-	if !ns.shouldNotify(notification) {
+	if !ns.shouldNotifyAdvanced(notification) {
 		fmt.Printf("Notificação ignorada (cooldown): %s para dispositivo %d\n", notification.Type, notification.DeviceID)
 		return nil
 	}
@@ -595,28 +595,77 @@ func (ns *NotificationService) saveNotificationLog(notification *DeviceNotificat
 	return ns.db.SaveNotificationLog(log)
 }
 
-func (ns *NotificationService) shouldNotify(notification *DeviceNotification) bool {
-	// Implementar lógica de cooldown para evitar spam
-	// Verificar se uma notificação do mesmo tipo foi enviada recentemente
+// CooldownConfig define configurações de cooldown por tipo de notificação
+type CooldownConfig struct {
+	DefaultMinutes  int
+	CriticalMinutes int
+	TypeSpecific    map[string]int // cooldown específico por tipo
+}
+
+// shouldNotifyAdvanced versão melhorada com configuração flexível
+func (ns *NotificationService) shouldNotifyAdvanced(notification *DeviceNotification) bool {
+	if ns.db == nil {
+		return true
+	}
+
+	// Configuração de cooldown
+	cooldownConfig := CooldownConfig{
+		DefaultMinutes:  30,
+		CriticalMinutes: 10,
+		TypeSpecific: map[string]int{
+			"client_outdated":          5,  // Muito crítico, pouco cooldown
+			"device_requires_reauth":   60, // Menos crítico, cooldown maior
+			"device_connection_error":  15, // Moderado
+			"webhook_delivery_failure": 30, // Default
+			"device_disconnected":      45, // Menos urgente
+		},
+	}
 
 	query := `
-		SELECT COUNT(*) FROM notification_logs 
-		WHERE device_id = $1 AND type = $2 AND created_at > $3
+		SELECT created_at 
+		FROM notification_logs 
+		WHERE device_id = $1 AND type = $2 
+		ORDER BY created_at DESC 
+		LIMIT 1
 	`
 
-	cooldownMinutes := 30 // 30 minutos de cooldown por padrão
-	if notification.Level == NotificationLevelCritical {
-		cooldownMinutes = 10 // Menos cooldown para críticas
+	// Determinar cooldown baseado no tipo e nível
+	var cooldownMinutes int
+	if specificCooldown, exists := cooldownConfig.TypeSpecific[notification.Type]; exists {
+		cooldownMinutes = specificCooldown
+	} else if notification.Level == NotificationLevelCritical {
+		cooldownMinutes = cooldownConfig.CriticalMinutes
+	} else {
+		cooldownMinutes = cooldownConfig.DefaultMinutes
 	}
 
-	cutoff := time.Now().Add(-time.Duration(cooldownMinutes) * time.Minute)
+	var lastNotificationTime time.Time
+	err := ns.db.QueryRow(query, notification.DeviceID, notification.Type).Scan(&lastNotificationTime)
 
-	var count int
-	err := ns.db.QueryRow(query, notification.DeviceID, notification.Type, cutoff).Scan(&count)
 	if err != nil {
-		fmt.Printf("Erro ao verificar cooldown: %v\n", err)
-		return true // Em caso de erro, permitir notificação
+		if err == sql.ErrNoRows {
+			fmt.Printf("✅ Primeira notificação %s para dispositivo %d - PERMITIDA\n",
+				notification.Type, notification.DeviceID)
+			return true
+		}
+
+		fmt.Printf("⚠️ Erro ao verificar cooldown, permitindo notificação: %v\n", err)
+		return true
 	}
 
-	return count == 0 // Notificar apenas se não há notificações recentes
+	timeSinceLastNotification := time.Since(lastNotificationTime)
+	cooldownDuration := time.Duration(cooldownMinutes) * time.Minute
+
+	shouldNotify := timeSinceLastNotification >= cooldownDuration
+
+	if shouldNotify {
+		fmt.Printf("✅ Cooldown expirado (%v >= %v) para %s dispositivo %d - PERMITIDA\n",
+			timeSinceLastNotification.Round(time.Minute), cooldownDuration, notification.Type, notification.DeviceID)
+	} else {
+		timeRemaining := cooldownDuration - timeSinceLastNotification
+		fmt.Printf("❌ Cooldown ativo para %s dispositivo %d - faltam %v - IGNORADA\n",
+			notification.Type, notification.DeviceID, timeRemaining.Round(time.Minute))
+	}
+
+	return shouldNotify
 }

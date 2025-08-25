@@ -389,6 +389,13 @@ func (m *Manager) ConnectAllApproved() {
 	}
 }
 
+// GetNotificationService retorna o serviço de notificação
+func (m *Manager) GetNotificationService() *notification.NotificationService {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	return m.notificationService
+}
+
 // ConnectClientSafely conecta um cliente com tratamento de erro mais robusto
 func (m *Manager) ConnectClientSafely(deviceID int64) error {
 	fmt.Printf("Tentando conectar dispositivo %d\n", deviceID)
