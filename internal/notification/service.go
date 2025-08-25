@@ -616,12 +616,12 @@ func (ns *NotificationService) shouldNotifyAdvanced(notification *DeviceNotifica
 	// Configuração de cooldown
 	cooldownConfig := CooldownConfig{
 		DefaultMinutes:  30,
-		CriticalMinutes: 10,
+		CriticalMinutes: 15,
 		TypeSpecific: map[string]int{
-			"client_outdated":          5,  // Muito crítico, pouco cooldown
+			"client_outdated":          15, // Muito crítico, pouco cooldown
 			"device_requires_reauth":   60, // Menos crítico, cooldown maior
-			"device_connection_error":  15, // Moderado
-			"webhook_delivery_failure": 30, // Default
+			"device_connection_error":  30, // Moderado
+			"webhook_delivery_failure": 60, // Default
 			"device_disconnected":      45, // Menos urgente
 		},
 	}

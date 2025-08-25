@@ -1181,8 +1181,3 @@ func (db *DB) AddTenantNotificationEmail(tenantID int64, emailType, email string
 	_, err := db.Exec(query, tenantID, emailType, email, pq.Array(notificationTypes))
 	return err
 }
-
-// ==============================================
-// 5. SCRIPT DE INICIALIZAÇÃO DE DADOS
-// Adicionar método para popular dados iniciais
-// ==============================================
