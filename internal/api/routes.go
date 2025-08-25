@@ -60,8 +60,6 @@ func SetupRoutes(router *gin.Engine, handler *Handler) {
 		// 	webhook.GET("/:id/logs", handler.GetWebhookLogs)
 		// }
 
-		// Rota para forçar notificação
-		api.POST("/notifications/force", handler.ForceNotification)
 		// Rotas de notificação corrigidas
 		api.GET("/notifications/status", handler.GetNotificationStatus)
 		api.POST("/notifications/test-reauth", handler.TriggerTestReauthNotification)
