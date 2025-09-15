@@ -230,7 +230,7 @@ func (ns *NotificationService) NotifyDeviceDisconnected(deviceID int64, deviceNa
 // Implementações dos métodos auxiliares
 
 func (ns *NotificationService) sendToAssistantAPI(notification *DeviceNotification) error {
-	url := fmt.Sprintf("%s/internal/whatsapp-notifications", ns.assistantAPIURL)
+	url := fmt.Sprintf("%s/whatsapp-notifications/notificar_saude_dispositivos", ns.assistantAPIURL)
 
 	jsonData, err := json.Marshal(notification)
 	if err != nil {
